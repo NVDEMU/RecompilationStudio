@@ -1,156 +1,14 @@
 # PSXRecomp Studio
 
 PSXRecomp Studio is the Qt front end for producing self-contained macOS,
-Windows, Linux, or **Virtua ARM** PlayStation apps and Game Boy Advance packages
-without creating a permanent per-title repository. A Windows Studio build exports
-Windows packages and a Linux Studio build exports Linux packages. macOS can
-select macOS, Windows, Linux, Virtua ARM, or **All**; All queues the three
-desktop targets into one output directory.
+Windows, or Linux PlayStation apps without creating a permanent per-title
+repository. A Windows Studio build exports Windows packages and a Linux Studio
+build exports Linux packages. macOS can select macOS, Windows, Linux, or
+**All**; All queues the three desktop targets into one output directory.
 
 It uses Qt 6 Widgets, Oclero Qlementine, Qlementine Icons,
 QtAppInstanceManager, and QuaZip. Work happens in a temporary directory; the
 selected output directory receives only the final platform package.
-
-## Game Boy Advance flow
-
-Choose **Game Boy Advance** in the System selector, then provide one `.gba`
-cartridge image and the canonical 16 KiB `gba_bios.bin`. Studio statically
-recompiles both with `extra/gbarecomp` — the same shape as the PlayStation flow.
-Batch mode scans recursively for `.gba` files.
-
-Function discovery runs **the recompiler first and Ghidra second**. Pass 1 runs
-`gba_recompile` from the cartridge entry point alone; it writes the guest extents
-its recursive descent proved reachable, and a headless Ghidra analysis
-(`ARM:LE:32:v4t`, raw image based at `0x08000000`, `TMode` deciding ARM vs THUMB)
-is then seeded from those extents. Disassembly may only *start* at an instruction
-the recompiler decoded. It stays free to follow flow out of them — resolving
-targets `gba_recompile` could not is the only reason Ghidra runs at all — so
-discovery is not confined, only its starting points are.
-
-**Ghidra is a seed source here, not a coverage oracle.** A cartridge image has
-no section table, so Ghidra disassembles compressed art and sample data exactly
-as willingly as it disassembles code, and it cannot tell which is which. On
-*Final Fantasy VI Advance* its stock analysis reports 120,079 functions whose
-bodies cover 99.6% of the 16 MiB ROM, 27,929 of them one byte long. Studio
-disables the byte-pattern function finders (`Function Start Search`, `… After
-Code`, `… After Data`) and `Non-Returning Functions - Discovered`, which brings
-body coverage to 50.9% — still far past the ~2.8% that is really code, because
-one word of sample data decoded as a branch generates references that
-manufacture more functions. Requiring the dispatch table to contain every
-Ghidra function would therefore mean translating megabytes of graphics.
-
-**Ghidra's reference classes are not trusted either**, because they are derived
-from that same decoding. A THUMB `BL` is two halfwords; where Ghidra decodes a
-second halfword with no first halfword in front of it, it models the result as a
-call through `LR` and propagates a destination into it — manufacturing a
-`COMPUTED_CALL` out of data. On ARMv4T there is no `BLX <reg>`, so a genuine
-`COMPUTED_CALL` is nearly impossible; on FFVI Ghidra reports **113,516
-`COMPUTED_CALL` references against 22 `COMPUTED_JUMP`**, its only real
-switch-table recovery. Each such function is analysed in turn, so the mistake
-feeds itself across cartridge data. Seeding on reference class alone admits the
-artifacts, and because each admitted seed extends the translated extent, the next
-pass admits more of them: a cascade that on FFVI reached 834,559 dispatch rows
-and 1.5 GB of generated C++ by pass 11.
-
-**Running Ghidra over the whole image first is what made that possible, so it no
-longer happens.** Measured on FFVI: an unseeded analysis produced 119,202
-functions covering 53% of the image in 26 minutes, and of the 131,737 reference
-sources it recorded, 426 landed on an instruction `gba_recompile` had decoded —
-374 of those themselves orphan `bl.lo` halfwords. Not one candidate passed a seed
-rule. Two of the log's recurring complaints are the same phenomenon: thousands of
-`Unable to resolve constructor` decompiler warnings are the switch analyser
-decompiling cartridge *data* (`0xB21A` at `0x087D7650` is `SXTH`, an ARMv6T2
-encoding that correctly does not exist in `ARM:LE:32:v4t`), and the
-`ContextChangeException` errors are `ArmAnalyzer` racing itself between its
-"is this address still undefined" check and its `TMode` write. Studio pins
-`ARM Constant Reference Analyzer.Max Threads` to 1 and passes `-max-cpu 1`: this
-manifest is a proof artifact seeds are admitted from, so two runs over the same
-bytes have to produce the same file. That is affordable only because the extents
-cut the input by more than an order of magnitude.
-
-So each pass asks **`gba_recompile`, not Ghidra, what the cited source address
-contains**. The shards carry both descriptions of the translation: a
-`/* 0xSTART mode=… end=0xEND … */` header above every lowered function, and one
-`/* ADDR  addr T mnemonic … */` comment per lowered instruction. Both come from
-recursive descent along real control flow out of the entry point, so neither
-walks into a texture. Being inside a translated extent is necessary but not
-sufficient — a span of real code can still have a Ghidra reference hanging off a
-byte offset that is not an instruction boundary at all. Three rules admit a
-candidate:
-
-- **direct-branch** — the recompiler decoded a `B`/`Bcc` or a *complete* `BL`
-  pair at the cited address, and its resolved destination is this entry. The
-  site's instruction set must match: ARMv4T has no `BLX`, so a direct branch
-  cannot change instruction set, and a mismatch means one side decoded data.
-- **register-indirect** — the recompiler decoded a `BX` or other `PC` write
-  there, so control provably leaves and it could not resolve where. This is the
-  one thing Ghidra can genuinely add. No mode constraint applies, because a `BX`
-  carries the destination instruction set in bit 0.
-- **pointer-word** — a data reference from a word inside a translated extent
-  whose stored value is exactly `entry | 1` for THUMB or `entry` for ARM, since
-  bit 0 of a `BX` target selects the instruction set. An exact test, not a
-  heuristic.
-
-Rejected as evidence: a cited address that is not an instruction boundary; an
-orphan `bl.lo`, because a branch whose target is unresolved says nothing about
-where control goes; and a direct branch resolving somewhere other than the
-candidate.
-
-Admitted entries are appended to the symbol TSV and the recompiler runs again;
-more translated code means wider extents, which is a new analysis with new
-starting points, so the passes iterate to a fixed point. The build converges when
-a pass admits nothing new — not when Ghidra's list is exhausted — and fails only
-if the fixed point is not reached within eight passes. `game.toml` is never
-auto-written; the recompiler is seeded through the TSV instead.
-`ghidra_coverage_proof.json` records every pass with per-rule counts and sampled
-admissions and rejections; each pass's raw manifest is
-`ghidra_analysis_pass<N>.json`, verified against the cartridge bytes in
-`ghidra_verification.json` before any seed is taken from it.
-
-On FFVI this converges on the **first** pass: every candidate Ghidra offers is
-either already translated or backed only by references manufactured from asset
-data. That is the honest result for this title, not a failure — the recompiler's
-own recursive descent and jump-table walking had already found 16,129 functions
-covering 464,308 bytes, concentrated in the first two MiB where the code
-actually lives, plus the IWRAM-copied routines higher up. All seven `BX`-sourced
-candidates that survive decoding were already covered: the recompiler resolves
-its own interworking veneers. The rules stay in place because they are general —
-on a title whose tables defeat the recompiler's `auto_jt` bounding, the
-register-indirect rule is what supplies the destination.
-
-An address both tools translated in *different* instruction sets is recorded in
-that proof, not fatal: Ghidra loses these on a raw cartridge (it has been
-observed calling four bytes in the middle of a THUMB run an ARM function),
-while the recompiler reached the address by following real control flow.
-Whatever remains unreached at the fixed point is handled honestly at runtime —
-a dispatch miss bridges through gbarecomp's reference interpreter, is counted
-in its coverage banner, and is emitted as a reviewable `game.toml` proposal
-fragment, never silently absorbed.
-
-The BIOS is recompiled and dispatched, never stubbed, HLE'd, or skipped: every
-title's first frames are real BIOS frames. There is no boot-skip option.
-
-CMake remains the CI entrypoint (`gba-runtime`). The exported project compiles
-the checked-in `generated/recompiled_*.cpp` shards and links the gbarecomp
-runtime libraries; it never needs the ROM, the network, or the recompiler at
-build time, and it refuses to configure if `generated/` is empty. Packages
-include the selected ROM and BIOS as resources, hash-verified at startup against
-the identities recorded in `game.toml`.
-
-The GBA runtime provides automatic keyboard/gamepad input, the shared static
-macOS Xbox/PDP GIP backend, keyboard rebinding, an in-game settings menu, and
-persistent audio/video/controller settings.
-
-**Virtua ARM builds the same recompiled cartridge, not a port.** The guest is
-ARMv4T and the device is ARMv7-A — two different instruction sets — so the
-`.virtua` image links the identical `generated/recompiled_*.cpp` shards, compiled
-by PowerEngine's clang instead of the host's. It does not go through the bundled
-Virtua SDL compatibility surface, which is missing the renderer viewport/fill/line
-calls, blend modes, audio device status, controller sensor, and touch entry
-points gbarecomp's desktop host uses. `extra/gba-to-mvii` replaces that layer
-outright and talks to `/dev/fb0`, `/dev/input0`, and `/dev/dac0` directly,
-compiling a curated subset of the core with no window, no audio device, and no
-overlay recompiler, since none of those exist on MVII.
 
 ## Required inputs
 
@@ -198,20 +56,14 @@ Linux archives contain the package contents directly at ZIP root, so the native
 executable is not hidden inside an extra package-directory layer. Disable the
 option to retain the unpacked `.app`, `-Windows`, and `-Linux` outputs.
 Every archive also contains a root `game.manifest.json` with `name` set to the
-edited game title and `executable` set to the root `.app`, `.exe`, Linux binary,
-or `.virtua` entry point. Virtua ARM packages use the `Virtua ARM` platform
-label.
+edited game title and `executable` set to the root `.app`, `.exe`, or Linux
+binary.
 
 ## Host tools
 
 Every export requires CMake; non-Windows hosts also require Ninja. PlayStation
-and Game Boy Advance exports additionally require Ghidra 11.3.2 and OpenJDK 21;
-PlayStation exports also require Python 3.
-Virtua ARM builds additionally require Go, a PowerEngine source checkout, and
-its LLVM/compiler bundle. Studio passes `POWERENGINE_ROOT` and
-`VIRTUA_LLVM_ROOT`; Dash, MVII POSIX headers, the Virtua packager, llvm-libc,
-libc++, and compiler-rt are consumed directly from those roots rather than
-copied under `extra/virtua`. On macOS, Studio detects both registered JDK bundles
+exports additionally require Ghidra 11.3.2, OpenJDK 21, and Python 3.
+On macOS, Studio detects both registered JDK bundles
 and keg-only Homebrew `openjdk@21` installations, then passes that exact
 `JAVA_HOME` to Ghidra.
 macOS exports additionally require:
@@ -265,8 +117,6 @@ Qt is bundled into the distributed Studio app. Qt is not linked into generated
 game apps; those use the PSXRecomp SDL runtime.
 
 ## PlayStation pipeline
-
-The Game Boy Advance pipeline is described under "Game Boy Advance flow" above.
 
 1. Parse the CUE and validate every referenced BIN, or validate the selected
    standalone BIN. Batch mode performs this discovery once and queues the
@@ -371,7 +221,7 @@ seeds/ghidra_funcs.txt
 
 **Enable wired Xbox/PDP controllers on macOS** is enabled by default. Studio
 requires the static libusb archive and rejects an export unless the finished
-PSX or GBA executable contains the native GIP symbols and has no dynamic libusb
+PlayStation executable contains the native GIP symbols and has no dynamic libusb
 dependency. The same `lib/recomp_gamepad` implementation is linked by CMake and
 by the Rust `native-gamepad` FFI crate. Player 1
 uses `p1_device = "auto"`; the runtime loads that packaged default before

@@ -13,6 +13,8 @@ cd "$ROOT"
 FILES=(
     recompiler/src/full_function_emitter.cpp
     recompiler/src/full_function_emitter.h
+    recompiler/src/compilation_units.cpp
+    recompiler/src/compilation_units.h
     recompiler/src/strict_translator.cpp
     recompiler/src/main_bios.cpp
     recompiler/src/function_discovery.cpp

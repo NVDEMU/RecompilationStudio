@@ -18,6 +18,12 @@ static uint32_t s_entry_pc;
 static int      s_configured   = 0;
 static int      s_save_pending = -1;   /* slot, or -1 */
 static int      s_load_pending = -1;
+/* Explicit-path requests (the netplay match restart). Kept separate from the
+ * slot pair so a player hitting F5 mid-negotiation can never be mistaken for a
+ * restart, or the other way round. */
+static char     s_save_path_pending[600];
+static char     s_load_path_pending[600];
+static void   (*s_path_observer)(int kind, int ok);
 
 extern int psx_hle_scheduler_enabled(void);
 
@@ -63,8 +69,38 @@ int savestate_request_load(int slot) {
     return 1;
 }
 
+int savestate_request_save_path(const char* path) {
+    if (!s_configured) { fprintf(stderr, "savestate: not configured\n"); return 0; }
+    if (!path || !path[0] || strlen(path) >= sizeof(s_save_path_pending)) return 0;
+    strcpy(s_save_path_pending, path);
+    return 1;
+}
+
+int savestate_request_load_path(const char* path) {
+    if (!s_configured) { fprintf(stderr, "savestate: not configured\n"); return 0; }
+    if (!path || !path[0] || strlen(path) >= sizeof(s_load_path_pending)) return 0;
+    if (!psx_hle_scheduler_enabled()) {
+        /* Same restriction as a slot load: the restore longjmp target lives on
+         * the scheduler fiber, and a cross-fiber unwind is unsafe. */
+        fprintf(stderr, "savestate: restore requires the HLE scheduler (default)\n");
+        return 0;
+    }
+    strcpy(s_load_path_pending, path);
+    return 1;
+}
+
+void savestate_set_path_observer(void (*observer)(int kind, int ok)) {
+    s_path_observer = observer;
+}
+
+static void report_path(int kind, int ok) {
+    if (s_path_observer) s_path_observer(kind, ok);
+}
+
 void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
-    if (s_save_pending < 0 && s_load_pending < 0) return;   /* hot path: nothing staged */
+    if (s_save_pending < 0 && s_load_pending < 0 &&
+        !s_save_path_pending[0] && !s_load_path_pending[0])
+        return;                                             /* hot path: nothing staged */
 
     if (s_save_pending >= 0) {
         int slot = s_save_pending;
@@ -96,6 +132,36 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
         } else {
             fprintf(stderr, "savestate: LOAD FAILED slot %d (missing/mismatched) %s\n",
                     slot, path);
+        }
+    }
+
+    if (s_save_path_pending[0]) {
+        char path[600];
+        strcpy(path, s_save_path_pending);
+        s_save_path_pending[0] = '\0';
+        CPUState snap = *cpu;
+        snap.pc = resume_pc;
+        int ok = boot_state_save(&snap, s_bios_checksum, s_entry_pc, path);
+        fprintf(stderr, "savestate: %s @ pc=0x%08X -> %s\n",
+                ok ? "SAVED" : "SAVE FAILED", (unsigned)resume_pc, path);
+        report_path(1, ok);
+    }
+
+    if (s_load_path_pending[0]) {
+        char path[600];
+        strcpy(path, s_load_path_pending);
+        s_load_path_pending[0] = '\0';
+        if (boot_state_load(path, s_bios_checksum, s_entry_pc, cpu)) {
+            psx_cycles_resync_after_restore();
+            fprintf(stderr, "savestate: RESTORED -> resuming pc=0x%08X (%s)\n",
+                    (unsigned)cpu->pc, path);
+            /* Tell the observer while the machine is restored but before the
+             * unwind, because the unwind never comes back here. */
+            report_path(2, 1);
+            psx_scheduler_resume_at(cpu->pc);
+        } else {
+            fprintf(stderr, "savestate: RESTORE FAILED (missing/mismatched) %s\n", path);
+            report_path(2, 0);
         }
     }
 }

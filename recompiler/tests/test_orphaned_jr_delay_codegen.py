@@ -99,10 +99,12 @@ def main() -> int:
         )
         if proc.returncode != 0:
             raise SystemExit(f"recompiler failed:\n{proc.stdout}\n{proc.stderr}")
-        generated = list(out_dir.glob("*_full.c"))
-        if len(generated) != 1:
-            raise SystemExit(f"expected one generated *_full.c, found {generated}")
-        body = function_body(generated[0].read_text(), "func_1FC00000")
+        generated = list(out_dir.glob("*_cu_*.c"))
+        if not generated:
+            generated = list(out_dir.glob("*_full.c"))
+        if not generated:
+            raise SystemExit(f"expected generated compilation units in {out_dir}")
+        body = function_body("\n".join(p.read_text() for p in generated), "func_1FC00000")
 
     delay_marker = "DELAY (orphaned) 0xBFC0000C: 27BD0028"
     stack_restore = "cpu->gpr[29] = (uint32_t)((int32_t)cpu->gpr[29] + (40));"

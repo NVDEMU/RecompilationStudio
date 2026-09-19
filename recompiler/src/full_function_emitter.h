@@ -3,8 +3,9 @@
 // Phase 2: Full BIOS C emitter.
 //
 // Given a DiscoveryResult and the ROM image, emits:
-//   - SCPH1001_full.c      (one C function per discovered BIOS function)
-//   - SCPH1001_dispatch.c  (normalized-address -> function-pointer table)
+//   - <stem>_cu_NNN_*.c    (function bodies, one compilation unit each)
+//   - <stem>_decls.h / <stem>_cu_prelude.h
+//   - <stem>_dispatch.c    (normalized-address -> function-pointer table)
 //
 // Design constraints:
 //   - Does NOT modify strict_translator. Consumes TranslateResult metadata
@@ -25,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include "compilation_units.h"
 #include "config_loader.h"
 #include "function_discovery.h"
 
@@ -50,7 +52,7 @@ struct ContinuationLabel {
 
 class FullFunctionEmitter {
 public:
-    // Emit SCPH1001_full.c and SCPH1001_dispatch.c into out_dir.
+    // Emit compilation-unit C files and SCPH1001_dispatch.c into out_dir.
     // rom: flat BIOS image bytes
     // base_addr: virtual address of rom[0] (0xBFC00000)
     // rom_end: last valid address inclusive (0xBFC7FFFF)
@@ -64,7 +66,9 @@ public:
         const std::string&                bios_sha256,
         const std::string&                out_dir,
         const std::vector<BiosVectorTable>& bios_vectors = {},
-        const std::vector<BiosAlias>&       bios_aliases = {});
+        const std::vector<BiosAlias>&       bios_aliases = {},
+        const std::string&                stem = "SCPH1001",
+        const PSXRecomp::CompilationUnitMap& cu_map = {});
 
 private:
     // Emit a single function's C code to the output stream.

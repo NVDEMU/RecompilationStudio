@@ -35,6 +35,22 @@ void savestate_configure(const char* dir, uint32_t bios_checksum, uint32_t entry
 int savestate_request_save(int slot);
 int savestate_request_load(int slot);
 
+/* The same save and load, to an explicit path rather than a numbered slot, and
+ * staged for the same block-leader boundary. This is what a netplay match
+ * restart is built from: the runtime rather than the player picks both the file
+ * and the moment, and the moment has to be a guest instant that both machines
+ * reach identically. Returns 1 if staged, 0 if it cannot be honored (the same
+ * conditions as the slot form). */
+int savestate_request_save_path(const char* path);
+int savestate_request_load_path(const char* path);
+
+/* Learn how an explicit-path request went once it has run: kind is 1 for a save
+ * and 2 for a load, ok is 0 on failure. A successful load never returns to its
+ * caller, so it reports immediately before unwinding to the scheduler. One
+ * observer; NULL clears it. The slot form does not report — the player can see
+ * for themselves whether the game moved. */
+void savestate_set_path_observer(void (*observer)(int kind, int ok));
+
 /* Called every block from psx_check_interrupts (in_exception == 0). If a save is
  * pending, serialize with cpu->pc = resume_pc; if a load is pending, restore and
  * longjmp to the scheduler (never returns in that case). Near-free when idle. */

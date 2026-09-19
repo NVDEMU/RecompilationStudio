@@ -16,6 +16,7 @@
 #include "code_generator.h"
 #include "annotations.hpp"
 #include "config_loader.h"
+#include "compilation_units.h"
 #include "rabbitizer.hpp"
 #include "fmt/format.h"
 
@@ -121,6 +122,18 @@ int main(int argc, char** argv) {
             break;
         }
     }
+    std::filesystem::path compilation_units_cli;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--compilation-units" && i + 1 < argc) {
+            compilation_units_cli = argv[i + 1];
+            break;
+        }
+        if (a.rfind("--compilation-units=", 0) == 0) {
+            compilation_units_cli = a.substr(std::string("--compilation-units=").size());
+            break;
+        }
+    }
 
     std::filesystem::path exe_path;
     std::string           extra_funcs_storage;  // lifetime anchor for the .c_str() below
@@ -146,6 +159,7 @@ int main(int argc, char** argv) {
                           ws_bg2d_cap_site = 0,
                           ws_bg2d_init_func = 0; // [widescreen.bg2d]
     std::filesystem::path out_dir = "generated";
+    std::filesystem::path compilation_units_path;
 
     if (!config_path.empty()) {
         const auto cfg = PSXRecompV4::load_game_config(config_path);
@@ -153,6 +167,7 @@ int main(int argc, char** argv) {
         extra_funcs_storage  = cfg.seeds_path.string();
         extra_funcs_path     = extra_funcs_storage.c_str();
         out_dir              = cfg.out_dir;
+        compilation_units_path = cfg.compilation_units_path;
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
                             cfg.ws_sprite_tag_funcs.end());
         ws_cull_bias.insert(cfg.ws_cull_bias_sites.begin(), cfg.ws_cull_bias_sites.end());
@@ -191,6 +206,8 @@ int main(int argc, char** argv) {
         fmt::print("  exe         = {}\n", exe_path.string());
         fmt::print("  seeds       = {}\n", extra_funcs_storage);
         fmt::print("  out_dir     = {}\n", out_dir.string());
+        if (!compilation_units_path.empty())
+            fmt::print("  compilation_units = {}\n", compilation_units_path.string());
         if (!ws_tag_funcs.empty())
             fmt::print("  ws_tag_funcs= {}\n", ws_tag_funcs.size());
         fmt::print("\n");
@@ -209,6 +226,8 @@ int main(int argc, char** argv) {
                 extra_funcs_path = argv[++i];
             } else if (arg == "--out-dir" && i + 1 < argc) {
                 out_dir = argv[++i];
+            } else if (arg == "--compilation-units" && i + 1 < argc) {
+                compilation_units_path = argv[++i];
             } else if (arg == "--strict") {
                 /* The PS-X EXE path is fail-loud by default; accepted for parity
                  * with psxrecomp-bios and project scripts. */
@@ -224,6 +243,8 @@ int main(int argc, char** argv) {
             }
         }
     }
+
+    if (!compilation_units_cli.empty()) compilation_units_path = compilation_units_cli;
 
     // --ws-config: merge the [widescreen] site lists from a side config WITHOUT
     // adopting its exe/paths. The overlay path is positional (no --config), so
@@ -1023,23 +1044,27 @@ int main(int argc, char** argv) {
                    dynamic_filename.string());
     }
 
-    std::filesystem::path output_filename = out_dir / (exe_stem + "_full.c");
-    fmt::print("Generating complete C file: {}\n", output_filename.string());
+    fmt::print("Generating compilation units: {}/{}_cu_*.c\n",
+               out_dir.string(), exe_stem);
 
-    std::string full_c_code = codegen.generate_file(analysis_result.functions, all_cfgs);
+    auto gen_funcs = codegen.generate_file_functions(analysis_result.functions, all_cfgs);
     std::set<uint32_t> dispatch_addrs;
-    {
-        const std::string marker = "void func_";
-        size_t pos = 0;
-        while ((pos = full_c_code.find(marker, pos)) != std::string::npos) {
-            size_t hex_pos = pos + marker.size();
-            if (hex_pos + 8 <= full_c_code.size() &&
-                full_c_code.compare(hex_pos + 8, 14, "(CPUState* cpu") == 0) {
-                std::string hex = full_c_code.substr(hex_pos, 8);
-                dispatch_addrs.insert((uint32_t)std::strtoul(hex.c_str(), nullptr, 16));
-            }
-            pos = hex_pos + 8;
-        }
+    std::vector<PSXRecomp::FunctionText> unit_funcs;
+    unit_funcs.reserve(gen_funcs.size());
+    for (const auto& gf : gen_funcs) {
+        PSXRecomp::FunctionText text;
+        text.addr = gf.start_addr != 0 ? gf.start_addr
+                                       : static_cast<uint32_t>(std::strtoul(
+                                             gf.function_name.size() > 5
+                                                 ? gf.function_name.c_str() + 5
+                                                 : "0",
+                                             nullptr, 16));
+        text.keep_together = gf.keep_together;
+        text.name = gf.function_name;
+        text.signature = gf.signature;
+        text.code = gf.full_code;
+        dispatch_addrs.insert(text.addr);
+        unit_funcs.push_back(std::move(text));
     }
     if (dispatch_addrs.empty()) {
         for (const auto& func : analysis_result.functions) {
@@ -1047,16 +1072,18 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::ofstream out_file(output_filename);
-    if (out_file.is_open()) {
-        out_file << full_c_code;
-        out_file.close();
-        fmt::print("✓ Saved {} lines to {}\n\n",
-                  std::count(full_c_code.begin(), full_c_code.end(), '\n'),
-                  output_filename.string());
-    } else {
-        fmt::print(stderr, "⚠ Failed to write output file\n\n");
+    PSXRecomp::CompilationUnitMap cu_map;
+    if (!compilation_units_path.empty()) {
+        cu_map = PSXRecomp::load_compilation_unit_map(compilation_units_path);
+        fmt::print("  Ghidra compilation-unit map: {} ({} entries, grouping={})\n",
+                   compilation_units_path.string(), cu_map.by_entry.size(),
+                   cu_map.grouping);
     }
+    auto cu_plan = PSXRecomp::plan_compilation_units(unit_funcs, cu_map);
+    PSXRecomp::write_modular_c(out_dir, exe_stem, codegen.generate_prelude(),
+                               unit_funcs, cu_plan);
+    fmt::print("✓ Wrote {} compilation units ({} functions, grouping={})\n\n",
+               cu_plan.units.size(), unit_funcs.size(), cu_plan.grouping);
 
     // Per-function code-range manifest (design §8): consumed by the overlay
     // loader's per-entry validity hash. Emitted alongside _full.c for every

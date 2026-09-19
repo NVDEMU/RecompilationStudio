@@ -2,8 +2,6 @@
 
 #include "CiPanel.h"
 #include "DiscCatalog.h"
-#include "GbaSupport.h"
-#include "GuestAppSupport.h"
 #include "PipelineSupport.h"
 #include "PipelineWorker.h"
 
@@ -64,9 +62,8 @@ QString batchNameSettingKey(const QString& id) {
   return QStringLiteral("batch/names/%1").arg(id);
 }
 
-/* Settings keys are per system so that switching the combo never carries one
- * system's paths into another's export. PlayStation and GBA keys are spelled
- * out because they predate this table and must keep reading existing configs. */
+/* Settings keys stay under the historical PlayStation prefixes so existing
+ * Studio configs keep loading. */
 struct SystemSettingsKeys {
   QString input;
   QString bios;
@@ -78,9 +75,7 @@ struct SystemSettingsKeys {
 SystemSettingsKeys systemSettingsKeys(SystemKind system) {
   const QString key = systemKindKey(system);
   SystemSettingsKeys keys;
-  keys.input = system == SystemKind::PlayStation      ? QStringLiteral("paths/psx_disc")
-               : system == SystemKind::GameBoyAdvance ? QStringLiteral("paths/gba_rom")
-                                                      : QStringLiteral("paths/%1_app").arg(key);
+  keys.input = QStringLiteral("paths/psx_disc");
   keys.bios = QStringLiteral("paths/%1_bios").arg(
     system == SystemKind::PlayStation ? QStringLiteral("psx") : key);
   keys.batch = QStringLiteral("batch/%1_directory").arg(
@@ -233,9 +228,7 @@ MainWindow::MainWindow(QWidget* parent)
   inputLayout->setSpacing(10);
   inputLayout->addWidget(makeSectionTitle(QStringLiteral("App inputs"), inputCard_));
 
-  /* The platform is the first choice and it stands above the system, because it
-   * decides which systems exist at all: the System combo below is filled from
-   * whatever is selected here, never the other way around. */
+  /* Platform is selected first; the system combo is filled from it. */
   auto* platformRow = new QWidget(inputCard_);
   platformRow->setMinimumHeight(34);
   auto* platformLayout = new QHBoxLayout(platformRow);
@@ -247,12 +240,9 @@ MainWindow::MainWindow(QWidget* parent)
   platformCombo_->addItem(QStringLiteral("macOS"), targetPlatformKey(TargetPlatform::MacOS));
   platformCombo_->addItem(QStringLiteral("Windows"), targetPlatformKey(TargetPlatform::Windows));
   platformCombo_->addItem(QStringLiteral("Linux"), targetPlatformKey(TargetPlatform::Linux));
-  platformCombo_->addItem(QStringLiteral("Virtua ARM"), targetPlatformKey(TargetPlatform::VirtuaArm));
   configureReadOnlyComboBox(platformCombo_);
   platformCombo_->setToolTip(QStringLiteral(
-    "The platform decides what can be built for it. Virtua ARM is the device's "
-    "own ARMv7, so it is the only platform that can run PlayStation Vita and "
-    "Nintendo Switch applications, whose code is never recompiled."));
+    "Desktop package platforms for the recompiled PlayStation program."));
   platformCombo_->setCurrentIndex(0);
   platformLayout->addWidget(platformLabel);
   platformLayout->addWidget(platformCombo_, 1);
@@ -268,9 +258,7 @@ MainWindow::MainWindow(QWidget* parent)
   // Filled by repopulateSystemCombo() from the platform combo above: which
   // systems are on offer is a consequence of the selected platform.
   configureReadOnlyComboBox(systemCombo_);
-  systemCombo_->setToolTip(QStringLiteral(
-    "PlayStation Vita and Nintendo Switch applications run their own ARMv7 "
-    "code, so they are listed here only while the platform is Virtua ARM."));
+  systemCombo_->setToolTip(QStringLiteral("PlayStation 1 static recompilation."));
   systemLayout->addWidget(systemLabel);
   systemLayout->addWidget(systemCombo_, 1);
   inputLayout->addWidget(systemRow);
@@ -369,19 +357,6 @@ MainWindow::MainWindow(QWidget* parent)
   toolsLayout->addWidget(makeSectionTitle(QStringLiteral("Analysis and export tools"), toolsCard_));
   ghidraEdit_ = addPathRow(toolsCard_, toolsLayout, QStringLiteral("Ghidra home"),
                            QStringLiteral("Ghidra 11.3.2 installation"), SLOT(chooseGhidraHome()));
-  powerEngineEdit_ = addPathRow(
-    toolsCard_, toolsLayout, QStringLiteral("PowerEngine root"),
-    QStringLiteral("PowerEngine directory containing External/Virtua and OS/MVII"),
-    SLOT(choosePowerEngineRoot()));
-  powerEngineEdit_->setToolTip(
-    QStringLiteral("Canonical PowerEngine source checkout used directly for Dash, POSIX headers,\n"
-                   "the Virtua packager, and MVII ABI headers. These files are not copied into PSXRecomp."));
-  llvmEdit_ = addPathRow(toolsCard_, toolsLayout, QStringLiteral("LLVM toolchain"),
-                         QStringLiteral("PowerEngine compiler bundle containing bin/compiler or bin/clang"),
-                         SLOT(chooseLlvmRoot()));
-  llvmEdit_->setToolTip(
-    QStringLiteral("PowerEngine LLVM/compiler bundle used for Virtua ARM. The matching ARM\n"
-                   "llvm-libc/libc++ sysroot and compiler-rt are resolved from the same PowerEngine build."));
   signingEnabled_ = new QCheckBox(QStringLiteral("Sign macOS app with PFX"), toolsCard_);
   signingEnabled_->setToolTip(
     QStringLiteral("Optional. The PFX is read directly and is never imported into a Keychain."));
@@ -583,7 +558,7 @@ MainWindow::MainWindow(QWidget* parent)
             applyTheme();
           });
   for (auto* edit : { discEdit_, batchDirectoryEdit_, biosEdit_, iconEdit_, titleEdit_, outputEdit_,
-                      certificateEdit_, certificatePasswordEdit_, ghidraEdit_, powerEngineEdit_, llvmEdit_,
+                      certificateEdit_, certificatePasswordEdit_, ghidraEdit_,
                       biosInitialSplashEdit_, biosHandoffImageEdit_ }) {
     connect(edit, &QLineEdit::textChanged, this, &MainWindow::updateBuildButton);
   }
@@ -758,57 +733,6 @@ QString MainWindow::detectGhidraHome() const {
   return {};
 }
 
-QString MainWindow::detectPowerEngineRoot() const {
-  const auto usable = [](const QString& root) {
-    if (root.isEmpty()) return false;
-    const QDir directory(root);
-    return QFileInfo::exists(directory.filePath(QStringLiteral("External/Virtua/Dash/CMakeLists.txt"))) &&
-           QFileInfo::exists(directory.filePath(QStringLiteral("External/Virtua/binary/virtua.go"))) &&
-           QFileInfo::exists(directory.filePath(
-             QStringLiteral("OS/MVII/Kernel/Shared/posix-shim/include/pthread.h")));
-  };
-  for (const auto& environmentName : { "POWERENGINE_ROOT", "POWER_ENGINE_ROOT" }) {
-    const QString environment = qEnvironmentVariable(environmentName);
-    if (usable(environment)) return QDir::cleanPath(environment);
-  }
-  for (const auto& candidate : {
-         QDir::home().filePath(QStringLiteral("Projects/PowerEngineV3/PowerEngine")),
-         QDir::home().filePath(QStringLiteral("Projects/PowerEngine")) }) {
-    if (usable(candidate)) return QDir::cleanPath(candidate);
-  }
-  return {};
-}
-
-QString MainWindow::detectLlvmRoot() const {
-  const auto usable = [](const QString& root) {
-    if (root.isEmpty()) return false;
-    const QDir bin(QDir(root).filePath(QStringLiteral("bin")));
-    return QFileInfo::exists(bin.filePath(QStringLiteral("compiler"))) ||
-           QFileInfo::exists(bin.filePath(QStringLiteral("clang")));
-  };
-  const QString environment = qEnvironmentVariable("VIRTUA_LLVM_ROOT");
-  if (usable(environment)) return QDir::cleanPath(environment);
-
-  const QString powerEngine = powerEngineEdit_ && !powerEngineEdit_->text().isEmpty()
-    ? powerEngineEdit_->text() : detectPowerEngineRoot();
-  if (!powerEngine.isEmpty()) {
-    const QDir root(powerEngine);
-    for (const auto& relative : {
-           QStringLiteral("build/Release/package/bin/Release/bundles/compiler"),
-           QStringLiteral("build/Release/stage/External/xbox/host/compiler"),
-           QStringLiteral("build/Debug/package/bin/Debug/bundles/compiler"),
-           QStringLiteral("build/Debug/stage/External/xbox/host/compiler") }) {
-      const QString candidate = root.filePath(relative);
-      if (usable(candidate)) return QDir::cleanPath(candidate);
-    }
-  }
-  for (const auto& candidate : { QStringLiteral("/usr/local/opt/llvm"),
-                                 QStringLiteral("/opt/homebrew/opt/llvm") }) {
-    if (usable(candidate)) return candidate;
-  }
-  return {};
-}
-
 void MainWindow::repopulateSystemCombo() {
   const TargetPlatform platform =
     targetPlatformFromKey(platformCombo_->currentData().toString());
@@ -820,9 +744,6 @@ void MainWindow::repopulateSystemCombo() {
   for (const SystemKind system : systems) {
     systemCombo_->addItem(systemKindDisplayName(system), systemKindKey(system));
   }
-  /* Leaving Virtua ARM drops Vita and Horizon from the list; the selection
-   * falls back to the platform's own first system rather than to whatever
-   * happens to sit at the index the old selection used to occupy. */
   int index = systemCombo_->findData(wanted);
   if (index < 0) {
     index = systemCombo_->findData(
@@ -853,8 +774,7 @@ void MainWindow::loadSettings() {
   const QString legacyIcon = settings.value(QStringLiteral("paths/icon")).toString();
   const QString legacyName = settings.value(QStringLiteral("app/window_title")).toString();
   systemState_.clear();
-  for (const SystemKind system : { SystemKind::PlayStation, SystemKind::GameBoyAdvance,
-                                   SystemKind::Vita, SystemKind::Horizon }) {
+  for (const SystemKind system : { SystemKind::PlayStation }) {
     const SystemSettingsKeys keys = systemSettingsKeys(system);
     // The unprefixed keys are the pre-multi-system layout, and the legacy icon
     // and title belonged to whichever system was selected when they were saved.
@@ -884,9 +804,6 @@ void MainWindow::loadSettings() {
   certificateEdit_->setText(settings.value(QStringLiteral("paths/certificate")).toString());
   signingEnabled_->setChecked(settings.value(QStringLiteral("signing/enabled"), false).toBool());
   ghidraEdit_->setText(settings.value(QStringLiteral("paths/ghidra"), detectGhidraHome()).toString());
-  powerEngineEdit_->setText(
-    settings.value(QStringLiteral("paths/powerengine"), detectPowerEngineRoot()).toString());
-  llvmEdit_->setText(settings.value(QStringLiteral("paths/llvm"), detectLlvmRoot()).toString());
   titleEdit_->setText(current.name);
   biosPatchEnabled_->setChecked(settings.value(QStringLiteral("bios_patch/enabled"), false).toBool());
   biosInitialSplashEdit_->setText(settings.value(QStringLiteral("bios_patch/initial_image")).toString());
@@ -931,8 +848,6 @@ void MainWindow::saveSettings() const {
   settings.setValue(QStringLiteral("paths/certificate"), certificateEdit_->text());
   settings.setValue(QStringLiteral("signing/enabled"), signingEnabled_->isChecked());
   settings.setValue(QStringLiteral("paths/ghidra"), ghidraEdit_->text());
-  settings.setValue(QStringLiteral("paths/powerengine"), powerEngineEdit_->text());
-  settings.setValue(QStringLiteral("paths/llvm"), llvmEdit_->text());
   settings.setValue(QStringLiteral("app/window_title"), titleEdit_->text());
   settings.setValue(QStringLiteral("bios_patch/enabled"), biosPatchEnabled_->isChecked());
   settings.setValue(QStringLiteral("bios_patch/initial_image"), biosInitialSplashEdit_->text());
@@ -942,7 +857,6 @@ void MainWindow::saveSettings() const {
   settings.setValue(QStringLiteral("runtime/skip_bios_boot"), skipBiosBoot_->isChecked());
   settings.remove(QStringLiteral("runtime/pad_mode"));
   settings.setValue(QStringLiteral("runtime/macos_gip_gamepad"), macosGipGamepad_->isChecked());
-  settings.remove(QStringLiteral("runtime/gba_virtua_native"));
   settings.setValue(QStringLiteral("export/as_zip"), exportAsZip_->isChecked());
   settings.setValue(QStringLiteral("export/mode"), exportModeCombo_->currentData().toString());
   settings.setValue(QStringLiteral("export/use_ci"), useCi_->isChecked());
@@ -950,81 +864,6 @@ void MainWindow::saveSettings() const {
 }
 
 void MainWindow::chooseDisc() {
-  if (systemRunsGuestNatively(currentSystem_)) {
-    const QString path = QFileDialog::getOpenFileName(
-      this, QStringLiteral("Select %1 application").arg(systemKindDisplayName(currentSystem_)),
-      discEdit_->text().isEmpty() ? QDir::homePath()
-                                  : QFileInfo(discEdit_->text()).absolutePath(),
-      guestAppFileFilter(currentSystem_));
-    if (path.isEmpty()) return;
-    GuestAppDescription app;
-    QString error;
-    if (!inspectGuestApp(currentSystem_, path, app, error)) {
-      QMessageBox::warning(this, QStringLiteral("Application selection"), error);
-      return;
-    }
-    /* The notes are what the container said about itself and the contents are
-     * what it holds; both were read whether or not the image turned out to be
-     * loadable, so a refusal shows the layer it stopped at with everything
-     * above it in the details. */
-    QStringList details = app.notes;
-    if (!app.contents.isEmpty()) {
-      if (!details.isEmpty()) details.append(QString());
-      details.append(QStringLiteral("%1 contains:").arg(app.containerName));
-      details.append(app.contents);
-    }
-    if (!app.loadable()) {
-      /* Refuse here rather than on the device. The front-end would refuse the
-       * same container, but only after the package had been built, copied to
-       * the J36 and launched. */
-      QMessageBox message(this);
-      message.setIcon(QMessageBox::Warning);
-      message.setWindowTitle(QStringLiteral("Unsupported %1 container")
-                               .arg(systemKindDisplayName(currentSystem_)));
-      message.setText(app.refusal);
-      if (!details.isEmpty())
-        message.setDetailedText(details.join(QLatin1Char('\n')));
-      message.exec();
-      return;
-    }
-    discEdit_->setText(path);
-    selectedBins_.clear();
-    if (titleEdit_->text().isEmpty()) titleEdit_->setText(app.suggestedTitle);
-    if (app.requiresExtraction) {
-      /* Say so at selection time: the export will not copy the file that was
-       * chosen, it will open it and take one entry out. */
-      logView_->appendPlainText(
-        QStringLiteral("%1: %2 — the export will extract %3 from it.")
-          .arg(QFileInfo(path).fileName(), app.containerName, app.executableName));
-      for (const QString& note : app.notes)
-        logView_->appendPlainText(QStringLiteral("  %1").arg(note));
-    }
-    return;
-  }
-
-  if (currentSystem_ == SystemKind::GameBoyAdvance) {
-    const QString path = QFileDialog::getOpenFileName(
-      this, QStringLiteral("Select Game Boy Advance ROM"),
-      discEdit_->text().isEmpty() ? QDir::homePath()
-                                  : QFileInfo(discEdit_->text()).absolutePath(),
-      QStringLiteral("Game Boy Advance ROMs (*.gba *.GBA);;All files (*)"));
-    if (path.isEmpty()) return;
-    GbaDescription game;
-    QString error;
-    if (!inspectGbaRom(path, game, error)) {
-      QMessageBox::warning(this, QStringLiteral("GBA ROM selection"), error);
-      return;
-    }
-    if (!game.warning.isEmpty()) {
-      QMessageBox::warning(this, QStringLiteral("Unusual GBA header"), game.warning);
-    }
-    discEdit_->setText(path);
-    selectedBins_.clear();
-    if (titleEdit_->text().isEmpty())
-      titleEdit_->setText(game.title + QStringLiteral(" Recompiled"));
-    return;
-  }
-
   const auto files = QFileDialog::getOpenFileNames(
     this, QStringLiteral("Select PlayStation BIN/CUE files"),
     discEdit_->text().isEmpty() ? QDir::homePath() : QFileInfo(discEdit_->text()).absolutePath(),
@@ -1071,129 +910,6 @@ void MainWindow::chooseBatchDirectory() {
   }
 }
 void MainWindow::populateBatchDirectory(const QString& path, bool showDialogs) {
-  if (systemRunsGuestNatively(currentSystem_)) {
-    const QString systemName = systemKindDisplayName(currentSystem_);
-    QList<GuestCatalogEntry> catalog;
-    QStringList warnings;
-    QString error;
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    const bool scanned = scanGuestAppDirectory(currentSystem_, path, catalog, warnings, error);
-    QApplication::restoreOverrideCursor();
-    batchDirectoryEdit_->setText(path);
-    batchEntries_.clear();
-    if (!scanned) {
-      batchSummaryLabel_->setText(error);
-      rebuildBatchList();
-      if (showDialogs) {
-        QMessageBox message(QMessageBox::Warning,
-                            QStringLiteral("No %1 applications found").arg(systemName),
-                            error, QMessageBox::Ok, this);
-        if (!warnings.isEmpty()) message.setDetailedText(warnings.join(QLatin1Char('\n')));
-        message.exec();
-      }
-      updateBuildButton();
-      return;
-    }
-    QSettings settings;
-    for (const auto& app : catalog) {
-      const QString id = batchEntrySettingsId(app.sourcePath);
-      const QString iconKey = batchIconSettingKey(id);
-      QString savedIcon = settings.value(iconKey).toString();
-      if (!savedIcon.isEmpty() && !QFileInfo(savedIcon).isFile()) {
-        settings.remove(iconKey);
-        savedIcon.clear();
-      }
-      const QString savedName = settings.value(
-        batchNameSettingKey(id), app.suggestedTitle).toString();
-      batchEntries_.append({ id, app.sourcePath, {}, savedName,
-                             savedIcon, QString(), app.containerName });
-    }
-    batchSummaryLabel_->setText(
-      warnings.isEmpty()
-        ? QStringLiteral("%1 %2 application%3 found. Edit names and choose optional icons below.")
-            .arg(QString::number(batchEntries_.size()), systemName,
-                 batchEntries_.size() == 1 ? QString() : QStringLiteral("s"))
-        : QStringLiteral("%1 %2 application%3 found; %4 file%5 skipped.")
-            .arg(QString::number(batchEntries_.size()), systemName,
-                 batchEntries_.size() == 1 ? QString() : QStringLiteral("s"),
-                 QString::number(warnings.size()),
-                 warnings.size() == 1 ? QString() : QStringLiteral("s")));
-    rebuildBatchList();
-    if (showDialogs && !warnings.isEmpty()) {
-      /* The warnings name each refused container, which is the useful half:
-       * an .nsp or a .pkg looks like a game right up until it is opened. */
-      QMessageBox warning(QMessageBox::Warning,
-                          QStringLiteral("Some files were skipped"),
-                          QStringLiteral("Studio found %1 loadable %2 application%3 "
-                                         "and skipped %4 file%5 it cannot open.")
-                            .arg(QString::number(batchEntries_.size()), systemName,
-                                 batchEntries_.size() == 1 ? QString() : QStringLiteral("s"),
-                                 QString::number(warnings.size()),
-                                 warnings.size() == 1 ? QString() : QStringLiteral("s")),
-                          QMessageBox::Ok, this);
-      warning.setDetailedText(warnings.join(QStringLiteral("\n")));
-      warning.exec();
-    }
-    updateBuildButton();
-    reflowForms(true);
-    return;
-  }
-
-  if (currentSystem_ == SystemKind::GameBoyAdvance) {
-    QList<GbaCatalogEntry> catalog;
-    QStringList warnings;
-    QString error;
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    const bool scanned = scanGbaDirectory(path, catalog, warnings, error);
-    QApplication::restoreOverrideCursor();
-    batchDirectoryEdit_->setText(path);
-    batchEntries_.clear();
-    if (!scanned) {
-      batchSummaryLabel_->setText(error);
-      rebuildBatchList();
-      if (showDialogs)
-        QMessageBox::warning(this, QStringLiteral("No GBA games found"), error);
-      updateBuildButton();
-      return;
-    }
-    QSettings settings;
-    for (const auto& game : catalog) {
-      const QString id = batchEntrySettingsId(game.sourcePath);
-      const QString iconKey = batchIconSettingKey(id);
-      QString savedIcon = settings.value(iconKey).toString();
-      if (!savedIcon.isEmpty() && !QFileInfo(savedIcon).isFile()) {
-        settings.remove(iconKey);
-        savedIcon.clear();
-      }
-      const QString savedName = settings.value(
-        batchNameSettingKey(id), game.suggestedTitle).toString();
-      batchEntries_.append({ id, game.sourcePath, {}, savedName,
-                             savedIcon, game.gameCode, QStringLiteral("GBA") });
-    }
-    batchSummaryLabel_->setText(
-      warnings.isEmpty()
-        ? QStringLiteral("%1 GBA game%2 found. Edit names and choose optional icons below.")
-            .arg(batchEntries_.size()).arg(batchEntries_.size() == 1 ? QString() : QStringLiteral("s"))
-        : QStringLiteral("%1 GBA game%2 found; %3 header warning%4 recorded.")
-            .arg(batchEntries_.size()).arg(batchEntries_.size() == 1 ? QString() : QStringLiteral("s"))
-            .arg(warnings.size()).arg(warnings.size() == 1 ? QString() : QStringLiteral("s")));
-    rebuildBatchList();
-    if (showDialogs && !warnings.isEmpty()) {
-      QMessageBox warning(QMessageBox::Warning, QStringLiteral("GBA header warnings"),
-                          QStringLiteral("Studio found %1 buildable GBA image%2 with %3 warning%4.")
-                            .arg(batchEntries_.size())
-                            .arg(batchEntries_.size() == 1 ? QString() : QStringLiteral("s"))
-                            .arg(warnings.size())
-                            .arg(warnings.size() == 1 ? QString() : QStringLiteral("s")),
-                          QMessageBox::Ok, this);
-      warning.setDetailedText(warnings.join(QStringLiteral("\n")));
-      warning.exec();
-    }
-    updateBuildButton();
-    reflowForms(true);
-    return;
-  }
-
   QList<DiscCatalogEntry> catalog;
   QStringList warnings;
   QString error;
@@ -1435,81 +1151,37 @@ void MainWindow::updateSystemControls() {
       populateBatchDirectory(batchDirectoryEdit_->text(), false);
   }
 
-  const bool gba = selected == SystemKind::GameBoyAdvance;
-  const bool vita = selected == SystemKind::Vita;
-  const bool guest = systemRunsGuestNatively(selected);
-
-  headerTitle_->setText(QStringLiteral("Build a native %1 app")
-                          .arg(systemKindDisplayName(selected)));
+  headerTitle_->setText(QStringLiteral("Build a native PlayStation app"));
   headerSubtitle_->setText(
-    guest
-      /* Say plainly that nothing is translated here. The device is an ARMv7-A
-       * Cortex-A7 and both guests are ARMv7-A, so the guest's instructions are
-       * the device's instructions; what gets built is the guest's OS. */
-      ? QStringLiteral("The guest is ARMv7 and so is the device, so nothing is recompiled: "
-                       "%1 supplies the %2 operating system and runs the application's own code.")
-          .arg(systemFrontEndName(selected), systemKindDisplayName(selected))
-      : gba
-        ? QStringLiteral("One workflow for Ghidra-seeded ARM/THUMB static recompilation, native compilation, and platform packaging.")
-        : QStringLiteral("One workflow for disc analysis, evidence-backed source generation, native compilation, and platform packaging."));
+    QStringLiteral("One workflow for disc analysis, evidence-backed source generation, native compilation, and platform packaging."));
 
   if (discLabel_) {
-    discLabel_->setText(vita   ? QStringLiteral("Vita application")
-                        : guest ? QStringLiteral("Switch application")
-                        : gba   ? QStringLiteral("GBA ROM")
-                                : QStringLiteral("Disc BIN/CUE"));
+    discLabel_->setText(QStringLiteral("Disc BIN/CUE"));
   }
-  discEdit_->setPlaceholderText(
-    vita   ? QStringLiteral("One .velf/.elf, unencrypted SELF, or .vpk")
-    : guest ? QStringLiteral("One ARM32 .nro or .nso")
-    : gba   ? QStringLiteral("One .gba cartridge image")
-            : QStringLiteral("One .cue and all referenced .bin files"));
+  discEdit_->setPlaceholderText(QStringLiteral("One .cue and all referenced .bin files"));
 
   if (biosLabel_) {
-    biosLabel_->setText(gba ? QStringLiteral("GBA BIOS (required)")
-                            : QStringLiteral("PlayStation BIOS"));
+    biosLabel_->setText(QStringLiteral("PlayStation BIOS"));
   }
-  biosEdit_->setPlaceholderText(gba
-    ? QStringLiteral("Canonical 16 KiB dump; statically recompiled and dispatched")
-    : QStringLiteral("Canonical SCPH1001.BIN only"));
+  biosEdit_->setPlaceholderText(QStringLiteral("Canonical SCPH1001.BIN only"));
 
   batchCheck_->setToolTip(
-    guest ? QStringLiteral("Scan a directory recursively and queue one export for every "
-                           "%1 application the front-end can open.")
-              .arg(systemKindDisplayName(selected))
-    : gba ? QStringLiteral("Scan a directory recursively and queue one export for every .gba image.")
-          : QStringLiteral("Scan a directory recursively and queue one export for every PlayStation CUE or standalone BIN image."));
+    QStringLiteral("Scan a directory recursively and queue one export for every PlayStation CUE or standalone BIN image."));
   batchDirectoryEdit_->setPlaceholderText(
-    vita   ? QStringLiteral("Folder containing .velf/.elf/.self/.vpk applications")
-    : guest ? QStringLiteral("Folder containing .nro/.nso applications")
-    : gba   ? QStringLiteral("Folder containing .gba cartridge images")
-            : QStringLiteral("Folder containing PlayStation BIN/CUE files"));
+    QStringLiteral("Folder containing PlayStation BIN/CUE files"));
   batchSummaryLabel_->setText(
-    guest ? QStringLiteral("Choose a directory to create the %1 application list. Icons are optional.")
-              .arg(systemKindDisplayName(selected))
-    : gba ? QStringLiteral("Choose a directory to create the GBA game list. Icons are optional.")
-          : QStringLiteral("Choose a directory to create the game list. Icons are optional."));
-  titleEdit_->setPlaceholderText(
-    vita   ? QStringLiteral("Example: VitaShell")
-    : guest ? QStringLiteral("Example: Homebrew Menu")
-    : gba   ? QStringLiteral("Example: Final Fantasy VI Advance Recompiled")
-            : QStringLiteral("Example: Evil Zone Recompiled"));
+    QStringLiteral("Choose a directory to create the game list. Icons are optional."));
+  titleEdit_->setPlaceholderText(QStringLiteral("Example: Evil Zone Recompiled"));
 
-  /* The PlayStation and GBA paths statically recompile from Ghidra-seeded
-   * discovery; the direct-execution guests never disassemble anything, and
-   * they have no BIOS to supply or brand. */
-  ghidraEdit_->parentWidget()->setVisible(!guest);
-  if (biosLabel_) biosLabel_->setVisible(!guest);
-  biosEdit_->parentWidget()->setVisible(!guest);
-  brandingCard_->setVisible(!gba && !guest);
-  skipBiosBoot_->setVisible(!gba && !guest);
-  padPolicyLabel_->setVisible(!gba && !guest);
+  ghidraEdit_->parentWidget()->setVisible(true);
+  if (biosLabel_) biosLabel_->setVisible(true);
+  biosEdit_->parentWidget()->setVisible(true);
+  brandingCard_->setVisible(true);
+  skipBiosBoot_->setVisible(true);
+  padPolicyLabel_->setVisible(true);
   macosGipGamepad_->setVisible(
-    !guest &&
-    (targetPlatformFromKey(platformCombo_->currentData().toString()) == TargetPlatform::MacOS ||
-     targetPlatformFromKey(platformCombo_->currentData().toString()) == TargetPlatform::All));
-  if (gba || guest) biosPatchEnabled_->setChecked(false);
-  if (guest) skipBiosBoot_->setChecked(false);
+    targetPlatformFromKey(platformCombo_->currentData().toString()) == TargetPlatform::MacOS ||
+    targetPlatformFromKey(platformCombo_->currentData().toString()) == TargetPlatform::All);
   updateBatchMode();
   updatePlatformControls();
   reflowForms(true);
@@ -1545,13 +1217,10 @@ void MainWindow::updateExportMode() {
 }
 
 void MainWindow::chooseBios() {
-  const bool gba = currentSystem_ == SystemKind::GameBoyAdvance;
   const auto path = QFileDialog::getOpenFileName(
-    this, gba ? QStringLiteral("Select 16 KiB GBA BIOS (required for package)")
-              : QStringLiteral("Select SCPH1001.BIN"),
+    this, QStringLiteral("Select SCPH1001.BIN"),
     QFileInfo(biosEdit_->text()).absolutePath(),
-    gba ? QStringLiteral("GBA BIOS (*.bin *.BIN);;All files (*)")
-        : QStringLiteral("SCPH1001 BIOS (SCPH1001.BIN);;BIN files (*.BIN *.bin)"));
+    QStringLiteral("SCPH1001 BIOS (SCPH1001.BIN);;BIN files (*.BIN *.bin)"));
   if (!path.isEmpty()) {
     biosEdit_->setText(path);
   }
@@ -1609,23 +1278,6 @@ void MainWindow::chooseGhidraHome() {
   }
 }
 
-void MainWindow::choosePowerEngineRoot() {
-  const auto path = QFileDialog::getExistingDirectory(
-    this, QStringLiteral("Select PowerEngine source directory"), powerEngineEdit_->text());
-  if (!path.isEmpty()) {
-    powerEngineEdit_->setText(path);
-    if (llvmEdit_->text().isEmpty()) llvmEdit_->setText(detectLlvmRoot());
-  }
-}
-
-void MainWindow::chooseLlvmRoot() {
-  const auto path = QFileDialog::getExistingDirectory(
-    this, QStringLiteral("Select PowerEngine LLVM/compiler bundle"), llvmEdit_->text());
-  if (!path.isEmpty()) {
-    llvmEdit_->setText(path);
-  }
-}
-
 PipelineRequest MainWindow::requestFromUi(bool overwrite) const {
   PipelineRequest request;
   request.system = systemKindFromKey(systemCombo_->currentData().toString());
@@ -1633,16 +1285,8 @@ PipelineRequest MainWindow::requestFromUi(bool overwrite) const {
   request.exportMode = exportModeFromKey(exportModeCombo_->currentData().toString());
   request.buildBackend = BuildBackend::Local;
   request.useCi = request.exportMode == ExportMode::Build && useCi_->isChecked();
-  /* romPath carries the single-file input for every system that has one: the
-   * cartridge for GBA, and the guest application image for Vita and Horizon.
-   * Only the PlayStation's descriptor-plus-tracks shape needs cuePath. */
-  if (request.system == SystemKind::GameBoyAdvance ||
-      systemRunsGuestNatively(request.system)) {
-    request.romPath = discEdit_->text();
-  } else {
-    request.cuePath = discEdit_->text();
-    request.selectedBinPaths = selectedBins_;
-  }
+  request.cuePath = discEdit_->text();
+  request.selectedBinPaths = selectedBins_;
   request.biosPath = biosEdit_->text();
   request.iconPath = iconEdit_->text();
   request.windowTitle = titleEdit_->text();
@@ -1652,8 +1296,6 @@ PipelineRequest MainWindow::requestFromUi(bool overwrite) const {
     request.certificatePassword = certificatePasswordEdit_->text();
   }
   request.ghidraHome = ghidraEdit_->text();
-  request.llvmRoot = llvmEdit_->text();
-  request.powerEngineRoot = powerEngineEdit_->text();
   request.frameworkRoot = QString::fromUtf8(PSXRECOMP_SOURCE_ROOT);
   request.patchBiosBranding = request.system == SystemKind::PlayStation &&
                                biosPatchEnabled_->isChecked();
@@ -1684,16 +1326,9 @@ QList<PipelineRequest> MainWindow::requestsFromUi(bool overwrite) const {
           request.certificatePath.clear();
           request.certificatePassword.clear();
         }
-        if (request.system == SystemKind::GameBoyAdvance ||
-            systemRunsGuestNatively(request.system)) {
-          request.romPath = entry.sourcePath;
-          request.cuePath.clear();
-          request.selectedBinPaths.clear();
-        } else {
-          request.cuePath = entry.sourcePath;
-          request.romPath.clear();
-          request.selectedBinPaths = entry.selectedBinPaths;
-        }
+        request.cuePath = entry.sourcePath;
+        request.romPath.clear();
+        request.selectedBinPaths = entry.selectedBinPaths;
         request.iconPath = entry.iconPath;
         request.windowTitle = entry.title.trimmed();
         requests.append(request);
@@ -2092,7 +1727,7 @@ void MainWindow::setBusy(bool busy) {
     progressBar_->setValue(0);
   }
   for (auto* edit : { discEdit_, batchDirectoryEdit_, biosEdit_, iconEdit_, titleEdit_, outputEdit_,
-                      certificateEdit_, certificatePasswordEdit_, ghidraEdit_, powerEngineEdit_, llvmEdit_,
+                      certificateEdit_, certificatePasswordEdit_, ghidraEdit_,
                       biosInitialSplashEdit_, biosHandoffImageEdit_ }) {
     edit->parentWidget()->setEnabled(!busy);
   }
@@ -2120,9 +1755,6 @@ void MainWindow::setBusy(bool busy) {
 void MainWindow::updatePlatformControls() {
   const auto selectedPlatform =
     targetPlatformFromKey(platformCombo_->currentData().toString());
-  /* The platform decides which systems exist. Leaving Virtua ARM while a guest
-   * is selected therefore changes the system too, and updateSystemControls()
-   * has to run for that before the rest of this function reads it. */
   const QString previousSystemKey = systemCombo_->currentData().toString();
   repopulateSystemCombo();
   if (systemCombo_->currentData().toString() != previousSystemKey ||
@@ -2139,38 +1771,19 @@ void MainWindow::updatePlatformControls() {
   const bool signingRequested = buildMode && includesMacos &&
                                 signingEnabled_->isChecked();
   const bool zip = exportAsZip_->isChecked();
-  /* Vita and Horizon exist on Virtua ARM only, so none of the desktop-platform
-   * controls apply to them and there is no BIOS or Ghidra input to show. */
-  const bool guest = systemRunsGuestNatively(currentSystem_);
-
-  signingEnabled_->setVisible(!guest && buildMode && includesMacos);
-  signingEnabled_->setEnabled(!guest && buildMode && includesMacos && !busy);
-  certificateEdit_->parentWidget()->setVisible(!guest && signingRequested);
-  certificatePasswordEdit_->parentWidget()->setVisible(!guest && signingRequested);
-  certificateEdit_->parentWidget()->setEnabled(!guest && signingRequested && !busy);
-  certificatePasswordEdit_->parentWidget()->setEnabled(!guest && signingRequested && !busy);
-  macosGipGamepad_->setVisible(!guest && includesMacos);
-  macosGipGamepad_->setEnabled(!guest && includesMacos && !busy);
-  // Virtua consumes PowerEngine in place and uses its LLVM/compiler bundle;
-  // neither dependency is duplicated into the generated framework. It is the
-  // only cross-compiled target, so only a selection that expands to it needs
-  // those roots — All is the three desktop platforms and builds with the host
-  // toolchain.
-  const bool needsVirtuaRoots =
-    concreteTargetPlatforms(selectedPlatform).contains(TargetPlatform::VirtuaArm);
-  powerEngineEdit_->parentWidget()->setVisible(needsVirtuaRoots);
-  powerEngineEdit_->parentWidget()->setEnabled(needsVirtuaRoots && !busy);
-  llvmEdit_->parentWidget()->setVisible(needsVirtuaRoots);
-  llvmEdit_->parentWidget()->setEnabled(needsVirtuaRoots && !busy);
-  ghidraEdit_->parentWidget()->setVisible(!guest);
-  if (biosLabel_) biosLabel_->setVisible(!guest);
-  biosEdit_->parentWidget()->setVisible(!guest);
-  // The platform is the primary choice, so it stays selectable for every system.
+  signingEnabled_->setVisible(buildMode && includesMacos);
+  signingEnabled_->setEnabled(buildMode && includesMacos && !busy);
+  certificateEdit_->parentWidget()->setVisible(signingRequested);
+  certificatePasswordEdit_->parentWidget()->setVisible(signingRequested);
+  certificateEdit_->parentWidget()->setEnabled(signingRequested && !busy);
+  certificatePasswordEdit_->parentWidget()->setEnabled(signingRequested && !busy);
+  macosGipGamepad_->setVisible(includesMacos);
+  macosGipGamepad_->setEnabled(includesMacos && !busy);
+  ghidraEdit_->parentWidget()->setVisible(true);
+  if (biosLabel_) biosLabel_->setVisible(true);
+  biosEdit_->parentWidget()->setVisible(true);
   platformCombo_->setEnabled(!busy);
-  useCi_->setEnabled(buildMode && !guest &&
-                     selectedPlatform != TargetPlatform::VirtuaArm && !busy);
-  if ((guest || selectedPlatform == TargetPlatform::VirtuaArm) && useCi_->isChecked())
-    useCi_->setChecked(false);
+  useCi_->setEnabled(buildMode && !busy);
   exportAsZip_->setText(exportMode == ExportMode::Source
     ? QStringLiteral("Export source as zip") : QStringLiteral("Export as zip"));
 
@@ -2201,24 +1814,6 @@ void MainWindow::updatePlatformControls() {
     outputEdit_->setPlaceholderText(zip
       ? QStringLiteral("Destination for the Windows ZIP")
       : QStringLiteral("Destination for the Windows app folder"));
-  } else if (selectedPlatform == TargetPlatform::VirtuaArm) {
-    signingNote_->setText(
-      guest
-        ? QStringLiteral(
-            "%1 cross-compiles for Cortex-A7 and stages the application beside the "
-            "ARMv7 .virtua. The application's own ARMv7 code is what runs; only the "
-            "%2 operating system is reimplemented.")
-            .arg(systemFrontEndName(currentSystem_), systemKindDisplayName(currentSystem_))
-        : currentSystem_ == SystemKind::GameBoyAdvance
-          ? QStringLiteral(
-              "Virtua ARM builds compile the recompiled cartridge and gbarecomp's emulation "
-              "core for Cortex-A7, on MVII's own framebuffer, input and DAC.")
-          : QStringLiteral(
-              "Virtua ARM builds link the recompiled PlayStation program into a cooperative "
-              "ARMv7 .virtua executable."));
-    outputEdit_->setPlaceholderText(zip
-      ? QStringLiteral("Destination for the Virtua ARM ZIP")
-      : QStringLiteral("Destination for the Virtua ARM package folder"));
   } else {
     signingNote_->setText(QStringLiteral(
       "Linux builds use the local native/cross toolchain or an authenticated Linux CI worker."));
@@ -2236,11 +1831,7 @@ void MainWindow::updateBuildButton() {
   const ExportMode exportMode =
     exportModeFromKey(exportModeCombo_->currentData().toString());
   const bool buildMode = exportMode == ExportMode::Build;
-  /* The direct-execution guests have no BIOS to supply, brand, or disassemble:
-   * vita2mvii and horizon2mvii reimplement the guest OS in native code. */
-  const bool guest = systemRunsGuestNatively(currentSystem_);
-  const bool brandingReady = currentSystem_ == SystemKind::GameBoyAdvance || guest ||
-    !biosPatchEnabled_->isChecked() ||
+  const bool brandingReady = !biosPatchEnabled_->isChecked() ||
     (!biosInitialSplashEdit_->text().isEmpty() && !biosHandoffImageEdit_->text().isEmpty());
   const auto selectedPlatform = targetPlatformFromKey(platformCombo_->currentData().toString());
   const bool includesMacos = selectedPlatform == TargetPlatform::MacOS ||
@@ -2259,20 +1850,12 @@ void MainWindow::updateBuildButton() {
   const auto selectedTargets = concreteTargetPlatforms(selectedPlatform);
   const bool localPlatformReady = !buildMode || useCi_->isChecked() ||
     std::all_of(selectedTargets.cbegin(), selectedTargets.cend(),
-                [this](TargetPlatform platform) {
-                  if (currentSystem_ == SystemKind::GameBoyAdvance &&
-                      platform != TargetPlatform::VirtuaArm) {
-                    return platform == hostTargetPlatform();
-                  }
+                [](TargetPlatform platform) {
                   return targetPlatformSupportedOnHost(platform);
                 });
-  const bool analysisReady = guest || !ghidraEdit_->text().isEmpty();
-  const bool biosReady = guest || !biosEdit_->text().isEmpty();
-  const bool needsVirtuaRoots = selectedTargets.contains(TargetPlatform::VirtuaArm);
-  const bool virtuaRootsReady = !needsVirtuaRoots ||
-    (!powerEngineEdit_->text().trimmed().isEmpty() &&
-     !llvmEdit_->text().trimmed().isEmpty());
-  const bool ready = gameReady && biosReady && virtuaRootsReady &&
+  const bool analysisReady = !ghidraEdit_->text().isEmpty();
+  const bool biosReady = !biosEdit_->text().isEmpty();
+  const bool ready = gameReady && biosReady &&
                      !outputEdit_->text().isEmpty() && analysisReady &&
                      signingReady && brandingReady && ciReady && localPlatformReady;
   buildButton_->setText(QStringLiteral("Export"));

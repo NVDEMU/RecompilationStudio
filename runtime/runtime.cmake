@@ -51,13 +51,7 @@ else()
     option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
 endif()
 
-option(PSX_VIRTUA "Build the runtime as an MVII Virtua application" OFF)
-
-if(PSX_VIRTUA)
-    include("${PSXRECOMP_ROOT}/extra/virtua/CMake/VirtuaPowerEngine.cmake")
-    set(SDL2_INCLUDE_DIRS "${PSXRECOMP_ROOT}/extra/virtua/sdl")
-    set(SDL2_LIBRARIES "PSXRECOMP_VIRTUA_SDL")
-elseif(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
+if(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
     if(MSVC)
         file(GLOB SDL2_MSVC_DIR "${PSXRECOMP_ROOT}/../sdl2-msvc/SDL2-*")
         if(SDL2_MSVC_DIR)
@@ -145,6 +139,26 @@ endif()
 # Turn OFF for a launcher-less runtime (boots straight in).
 option(PSX_LAUNCHER "Build the integrated RmlUi launcher UI" ON)
 option(PSX_SETTINGS_MENU "Build the ESC pause/settings menu" ON)
+
+# PSX_NETPLAY: play a recompiled title against another machine through NeoGeo
+# Hub Online (runtime/src/psx_netplay.cpp; runtime/include/psx_netplay.h has the
+# model). The protocol is not vendored here — the client, this emulator and the
+# engine all compile the SAME sources out of the Online repository, because a
+# game and the client that pairs it must not be able to disagree about what a
+# frame is. Silently off when that repository is not beside this one, which is
+# the ordinary standalone checkout.
+set(PSXRECOMP_NETPLAY_DIR "${PSXRECOMP_ROOT}/../Tournament/sources"
+    CACHE PATH "NeoGeo Hub Online 'sources' directory (the one holding netplay/)")
+option(PSX_NETPLAY "Build online / tournament play" ON)
+
+# Build the shared netplay library once per CMake project (idempotent — the
+# target itself guards re-entry, so several runtime targets can ask for it).
+function(psxrecomp_ensure_netplay_lib)
+    if(NOT TARGET neogeohub-netplay)
+        add_subdirectory("${PSXRECOMP_NETPLAY_DIR}/netplay"
+                         "${CMAKE_BINARY_DIR}/_deps/neogeohub-netplay-build")
+    endif()
+endfunction()
 
 # Build the vendored RmlUi + FreeType once per CMake project (idempotent — the
 # rmlui_core target guards re-entry). Both are linked statically into the exe so
@@ -255,17 +269,6 @@ set(PSXRECOMP_RUNTIME_SOURCES
     # auto-detects the host arch (SLJIT_CONFIG_AUTO). See lib/sljit/LICENSE.
     ${PSXRECOMP_ROOT}/lib/sljit/sljit_src/sljitLir.c
  )
-if(PSX_VIRTUA)
-    list(REMOVE_ITEM PSXRECOMP_RUNTIME_SOURCES
-        ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
-        ${PSXRECOMP_ROOT}/runtime/src/psx_fiber.c)
-    list(APPEND PSXRECOMP_RUNTIME_SOURCES
-        ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer_virtua.c
-        ${PSXRECOMP_ROOT}/runtime/src/psx_fiber_virtua.c
-        ${PSXRECOMP_ROOT}/runtime/src/psx_fiber_virtua.S
-        ${PSXRECOMP_ROOT}/extra/virtua/sdl/sdl_virtua.cpp
-        ${VIRTUA_POWERENGINE_VIRTUA_ROOT}/Dash/llvm_libc_stubs.cpp)
-endif()
 if(PSXRECOMP_GIP_GAMEPAD_AVAILABLE)
     list(APPEND PSXRECOMP_RUNTIME_SOURCES
         ${PSXRECOMP_ROOT}/runtime/src/gip_gamepad.cpp)
@@ -301,8 +304,23 @@ endfunction()
 if(NOT DEFINED PSXRECOMP_BIOS_STEM)
     set(PSXRECOMP_BIOS_STEM "SCPH1001")
 endif()
+file(GLOB PSXRECOMP_BIOS_UNITS CONFIGURE_DEPENDS
+    "${PSXRECOMP_ROOT}/generated/${PSXRECOMP_BIOS_STEM}_cu_*.c")
+list(SORT PSXRECOMP_BIOS_UNITS)
+if(PSXRECOMP_BIOS_UNITS AND EXISTS "${PSXRECOMP_ROOT}/generated/${PSXRECOMP_BIOS_STEM}_full.c")
+    message(FATAL_ERROR
+        "BIOS ${PSXRECOMP_BIOS_STEM} has both _cu_*.c compilation units and a stale "
+        "${PSXRECOMP_BIOS_STEM}_full.c monolith. Delete the monolith and regenerate.")
+endif()
+if(NOT PSXRECOMP_BIOS_UNITS AND EXISTS "${PSXRECOMP_ROOT}/generated/${PSXRECOMP_BIOS_STEM}_full.c")
+    message(WARNING
+        "BIOS ${PSXRECOMP_BIOS_STEM}_full.c is a legacy monolith; regenerate with "
+        "tools/regen_bios.sh to split into compilation units.")
+    set(PSXRECOMP_BIOS_UNITS
+        ${PSXRECOMP_ROOT}/generated/${PSXRECOMP_BIOS_STEM}_full.c)
+endif()
 set(PSXRECOMP_BIOS_GENERATED
-    ${PSXRECOMP_ROOT}/generated/${PSXRECOMP_BIOS_STEM}_full.c
+    ${PSXRECOMP_BIOS_UNITS}
     ${PSXRECOMP_ROOT}/generated/${PSXRECOMP_BIOS_STEM}_dispatch.c
 )
 
@@ -315,7 +333,7 @@ set(PSXRECOMP_BIOS_GENERATED
 # mismatch so the staleness is impossible to miss. Non-fatal: a stale-but-consistent
 # BIOS still builds; opt out with -DPSXRECOMP_SKIP_BIOS_STALE_CHECK=ON.
 if(NOT PSXRECOMP_SKIP_BIOS_STALE_CHECK AND
-   EXISTS "${PSXRECOMP_ROOT}/generated/${PSXRECOMP_BIOS_STEM}_full.c" AND
+   PSXRECOMP_BIOS_UNITS AND
    EXISTS "${PSXRECOMP_ROOT}/generated/${PSXRECOMP_BIOS_STEM}_dispatch.c")
     find_program(_psxrt_bash NAMES bash)
     set(_psxrt_stamp "${PSXRECOMP_ROOT}/generated/${PSXRECOMP_BIOS_STEM}.emitter.sha")
@@ -362,7 +380,7 @@ function(psxrecomp_add_runtime_target target)
         BIOS_GENERATED_DISPATCH_C
         APP_SUPPORT_DIR_NAME
     )
-    set(multiValueArgs EXTRAS_SOURCES)
+    set(multiValueArgs EXTRAS_SOURCES BIOS_GENERATED_UNITS GAME_GENERATED_UNITS)
     cmake_parse_arguments(PSXRT "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     # DEBUG_PORT and WINDOW_TITLE were previously required cmake-time defaults.
@@ -381,15 +399,22 @@ function(psxrecomp_add_runtime_target target)
         set(PSXRT_DEFAULT_GAME_CONFIG_PATH "")
     endif()
 
-    if(PSXRT_BIOS_GENERATED_FULL_C OR PSXRT_BIOS_GENERATED_DISPATCH_C)
-        if(NOT PSXRT_BIOS_GENERATED_FULL_C OR NOT PSXRT_BIOS_GENERATED_DISPATCH_C)
+    if(PSXRT_BIOS_GENERATED_UNITS OR PSXRT_BIOS_GENERATED_FULL_C OR PSXRT_BIOS_GENERATED_DISPATCH_C)
+        if(NOT PSXRT_BIOS_GENERATED_DISPATCH_C)
             message(FATAL_ERROR
-                "psxrecomp_add_runtime_target: BIOS_GENERATED_FULL_C and "
-                "BIOS_GENERATED_DISPATCH_C must be supplied together")
+                "psxrecomp_add_runtime_target: BIOS_GENERATED_DISPATCH_C is required "
+                "when supplying BIOS generated sources")
         endif()
-        set(_psxrt_bios_generated
-            "${PSXRT_BIOS_GENERATED_FULL_C}"
-            "${PSXRT_BIOS_GENERATED_DISPATCH_C}")
+        if(PSXRT_BIOS_GENERATED_UNITS)
+            set(_psxrt_bios_generated ${PSXRT_BIOS_GENERATED_UNITS})
+        elseif(PSXRT_BIOS_GENERATED_FULL_C)
+            set(_psxrt_bios_generated "${PSXRT_BIOS_GENERATED_FULL_C}")
+        else()
+            message(FATAL_ERROR
+                "psxrecomp_add_runtime_target: BIOS_GENERATED_UNITS or "
+                "BIOS_GENERATED_FULL_C must be supplied with BIOS_GENERATED_DISPATCH_C")
+        endif()
+        list(APPEND _psxrt_bios_generated "${PSXRT_BIOS_GENERATED_DISPATCH_C}")
     else()
         set(_psxrt_bios_generated ${PSXRECOMP_BIOS_GENERATED})
     endif()
@@ -397,7 +422,13 @@ function(psxrecomp_add_runtime_target target)
         set_source_files_properties("${_psxrt_bios_source}" PROPERTIES GENERATED TRUE)
     endforeach()
     set(generated_sources ${_psxrt_bios_generated})
-    if(PSXRT_GAME_GENERATED_FULL_C)
+    if(PSXRT_GAME_GENERATED_UNITS)
+        foreach(_psxrt_game_unit IN LISTS PSXRT_GAME_GENERATED_UNITS)
+            set_source_files_properties("${_psxrt_game_unit}" PROPERTIES GENERATED TRUE)
+            list(APPEND generated_sources "${_psxrt_game_unit}")
+        endforeach()
+        set(has_game_dispatch TRUE)
+    elseif(PSXRT_GAME_GENERATED_FULL_C)
         set_source_files_properties("${PSXRT_GAME_GENERATED_FULL_C}" PROPERTIES GENERATED TRUE)
         list(APPEND generated_sources "${PSXRT_GAME_GENERATED_FULL_C}")
         set(has_game_dispatch TRUE)
@@ -505,19 +536,21 @@ function(psxrecomp_add_runtime_target target)
         ${PSXRECOMP_ROOT}/runtime/src/boot_state.c
         PROPERTIES OBJECT_DEPENDS ${_codegen_hash_hdr})
 
+    set(_psxrt_gen_include_dirs)
+    foreach(_psxrt_src IN LISTS generated_sources)
+        get_filename_component(_psxrt_src_dir "${_psxrt_src}" DIRECTORY)
+        if(_psxrt_src_dir)
+            list(APPEND _psxrt_gen_include_dirs "${_psxrt_src_dir}")
+        endif()
+    endforeach()
+    if(_psxrt_gen_include_dirs)
+        list(REMOVE_DUPLICATES _psxrt_gen_include_dirs)
+    endif()
     target_include_directories(${target} PRIVATE
         ${PSXRECOMP_RUNTIME_INCLUDE_DIRS}
         ${SDL2_INCLUDE_DIRS}
+        ${_psxrt_gen_include_dirs}
     )
-    if(PSX_VIRTUA)
-        target_include_directories(${target} BEFORE PRIVATE
-            ${VIRTUA_POWERENGINE_POSIX_INCLUDE}
-            ${PSXRECOMP_ROOT}/extra/virtua/include
-            ${VIRTUA_POWERENGINE_VIRTUA_ROOT}
-            ${VIRTUA_POWERENGINE_VIRTUA_ROOT}/Dash
-            ${VIRTUA_ARM_SYSROOT}/include
-            ${VIRTUA_ARM_CXX_INCLUDE})
-    endif()
     # pkg-config reports SDL2_LIBRARIES as a bare name (e.g. "SDL2" -> -lSDL2);
     # add its library dirs so the linker finds it outside default paths
     # (e.g. Homebrew's /opt/homebrew/lib on macOS). Empty/harmless on MSVC.
@@ -528,9 +561,7 @@ function(psxrecomp_add_runtime_target target)
     # --static link line (libSDL2.a + the full Windows system-lib chain SDL2
     # needs: winmm, imm32, ole32, oleaut32, version, setupapi, dinput8, ...).
     # Otherwise link the SDL2 import lib (needs SDL2.dll at runtime).
-    if(PSX_VIRTUA)
-        # The SDL surface is compiled directly into PSXRECOMP_RUNTIME_SOURCES.
-    elseif(PSX_STATIC_RUNTIME AND SDL2_STATIC_LDFLAGS)
+    if(PSX_STATIC_RUNTIME AND SDL2_STATIC_LDFLAGS)
         target_link_libraries(${target} PRIVATE ${SDL2_STATIC_LDFLAGS})
     else()
         target_link_libraries(${target} PRIVATE ${SDL2_LIBRARIES})
@@ -557,103 +588,6 @@ function(psxrecomp_add_runtime_target target)
         FMT_HEADER_ONLY=1
         $<$<CXX_COMPILER_ID:MSVC>:SDL_MAIN_HANDLED>
     )
-    if(PSX_VIRTUA)
-        target_compile_definitions(${target} PRIVATE
-            PSX_VIRTUA=1
-            MINOS_PLATFORM_MACHINE64=1
-            MINOS_PLATFORM_ARMV7=1
-            MINOS_VIRTUA_USERLAND=1
-            _LIBCPP_HAS_NO_THREADS
-            _LIBCPP_DISABLE_AVAILABILITY
-            _LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE
-            FMT_STATIC_THOUSANDS_SEPARATOR=44)
-        target_compile_options(${target} PRIVATE
-            "--target=${VIRTUA_ARM_TARGET_TRIPLE}"
-            "--sysroot=${VIRTUA_ARM_SYSROOT}"
-            -mcpu=cortex-a7
-            -marm
-            -mfloat-abi=soft
-            -mno-unaligned-access
-            -femulated-tls
-            -ffreestanding
-            -fpie
-            -fno-stack-protector
-            -fno-common
-            -fno-vectorize
-            -fno-slp-vectorize
-            -ffunction-sections
-            -fdata-sections
-            $<$<COMPILE_LANGUAGE:CXX>:-nostdinc++>
-            $<$<COMPILE_LANGUAGE:CXX>:-fno-threadsafe-statics>
-            $<$<COMPILE_LANGUAGE:CXX>:-fno-use-cxa-atexit>
-            $<$<COMPILE_LANGUAGE:CXX>:-isystem${VIRTUA_ARM_CXX_INCLUDE}>
-            $<$<COMPILE_LANGUAGE:CXX>:SHELL:-include virtua_cpp_thread_shim.h>)
-
-        if(NOT TARGET R-Dash)
-            set(VIRTUA_ROOT "${VIRTUA_POWERENGINE_VIRTUA_ROOT}")
-            set(DASH_FIXED_HEAP_BYTES 0)
-            add_subdirectory(${VIRTUA_POWERENGINE_VIRTUA_ROOT}/Dash
-                             ${CMAKE_BINARY_DIR}/virtua-dash EXCLUDE_FROM_ALL)
-        endif()
-        target_include_directories(R-Dash BEFORE PUBLIC
-            ${VIRTUA_POWERENGINE_POSIX_INCLUDE}
-            ${VIRTUA_ARM_SYSROOT}/include
-            ${VIRTUA_ARM_CXX_INCLUDE})
-        target_compile_definitions(R-Dash PUBLIC
-            MINOS_PLATFORM_MACHINE64=1
-            MINOS_PLATFORM_ARMV7=1
-            MINOS_VIRTUA_USERLAND=1
-            _LIBCPP_HAS_NO_THREADS
-            _LIBCPP_DISABLE_AVAILABILITY
-            _LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE)
-        target_compile_options(R-Dash PRIVATE
-            "--target=${VIRTUA_ARM_TARGET_TRIPLE}"
-            "--sysroot=${VIRTUA_ARM_SYSROOT}"
-            -mcpu=cortex-a7
-            -marm
-            -mfloat-abi=soft
-            -mno-unaligned-access
-            -femulated-tls
-            -ffreestanding
-            -fpie
-            -fno-stack-protector
-            -fno-common
-            -ffunction-sections
-            -fdata-sections
-            $<$<COMPILE_LANGUAGE:CXX>:-nostdinc++>
-            $<$<COMPILE_LANGUAGE:CXX>:-fno-threadsafe-statics>
-            $<$<COMPILE_LANGUAGE:CXX>:-fno-use-cxa-atexit>
-            $<$<COMPILE_LANGUAGE:CXX>:-isystem${VIRTUA_ARM_CXX_INCLUDE}>)
-        add_dependencies(${target} R-Dash)
-        target_link_directories(${target} PRIVATE
-            ${VIRTUA_ARM_SYSROOT}/lib
-            ${VIRTUA_ARM_SYSROOT}/lib/${VIRTUA_ARM_TARGET_TRIPLE})
-        target_link_options(${target} PRIVATE
-            "--target=${VIRTUA_ARM_TARGET_TRIPLE}"
-            "--sysroot=${VIRTUA_ARM_SYSROOT}"
-            -mcpu=cortex-a7
-            -marm
-            -mfloat-abi=soft
-            -femulated-tls
-            -fuse-ld=lld
-            -nostdlib
-            -nostartfiles
-            -static
-            -Wl,--emit-relocs
-            -Wl,--gc-sections
-            -Wl,--build-id=none
-            "-Wl,-T,${VIRTUA_ARM_LINKER_SCRIPT}"
-            -Wl,--whole-archive
-            $<TARGET_FILE:R-Dash>
-            -Wl,--no-whole-archive)
-        target_link_libraries(${target} PRIVATE
-            c++ c++abi unwind c m
-            ${VIRTUA_ARM_COMPILER_RT})
-        set_target_properties(${target} PROPERTIES
-            SUFFIX ".elf"
-            LINK_DEPENDS "${VIRTUA_ARM_LINKER_SCRIPT}")
-    endif()
-
     if(MSVC)
         # windows.h defines function-like min/max macros unless NOMINMAX is set;
         # those macros corrupt qualified calls such as std::max(...).
@@ -687,6 +621,21 @@ function(psxrecomp_add_runtime_target target)
     # run) are driven in cycle-lockstep by tools/cosim.py.
     if(PSXRT_COSIM)
         target_compile_definitions(${target} PRIVATE PSX_COSIM=1 PSX_NO_DEBUG_TOOLS=1)
+    endif()
+
+    # Online / tournament play. The oracle build is a headless comparator, so it
+    # has no business holding a socket open to another player's machine.
+    if(PSX_NETPLAY AND NOT PSXRT_ORACLE
+       AND EXISTS "${PSXRECOMP_NETPLAY_DIR}/netplay/CMakeLists.txt")
+        psxrecomp_ensure_netplay_lib()
+        target_sources(${target} PRIVATE
+            ${PSXRECOMP_ROOT}/runtime/src/psx_netplay.cpp)
+        target_link_libraries(${target} PRIVATE neogeohub-netplay)
+        target_compile_definitions(${target} PRIVATE PSX_NETPLAY=1)
+    elseif(PSX_NETPLAY AND NOT PSXRT_ORACLE)
+        message(STATUS
+            "psxrecomp: online play off — no netplay sources at "
+            "${PSXRECOMP_NETPLAY_DIR}/netplay (set PSXRECOMP_NETPLAY_DIR)")
     endif()
 
     # Shared RmlUi frontend. The pre-launch dashboard is optional, while the
@@ -752,9 +701,7 @@ function(psxrecomp_add_runtime_target target)
         endif()
     endif()
 
-    if(PSX_VIRTUA)
-        # Video and audio are provided by the Virtua device ABI.
-    elseif(WIN32 OR MINGW)
+    if(WIN32 OR MINGW)
         # opengl32: GL backend (gpu_gl_renderer.c). GL 1.x is exported directly
         # by opengl32; Phase 2b will load modern GL via SDL_GL_GetProcAddress.
         target_link_libraries(${target} PRIVATE ws2_32 dbghelp comdlg32 opengl32)

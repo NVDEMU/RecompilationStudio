@@ -213,6 +213,12 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-09-18 (PSX-only tree; fmt literal-operator warning):**
+  Studio/runtime stay PlayStation-only: Virtua ARM, GBA, Vita, and Horizon extras
+  and export paths are removed. Vendored fmt/toml11 user-defined literals no
+  longer use a space in `operator""_a` / `operator""_toml`. Timing core
+  unchanged this session.
+
 - **2026-07-11 (Tomba 2 OpenGL full-attract performance + audio acceptance):**
   Resolved the shared renderer/overlay/capture cascade that made Beach, Whoopee
   FMVs, Mines, and Mine Cart slow. OpenGL now avoids mandatory present readback,

@@ -43,9 +43,12 @@ The translation pipeline:
 | Discovery | `function_discovery.cpp`, `function_analysis.cpp` | Find function entry points (seeded from Ghidra exports) |
 | Codegen | `code_generator.cpp`, `full_function_emitter.cpp`, `strict_translator.cpp` | Emit C: one function per guest function, plus a dispatch table |
 
-Output is **two files** per program: a `_full.c` (the function bodies) and a
-`_dispatch.c` (the address→function dispatch table). Both are build artifacts and
-are **never hand-edited** — if the C is wrong, the fix is in the recompiler.
+Output is **modular compilation units** per program: `<stem>_cu_NNN_*.c`
+function bodies (split using a Ghidra compilation-unit map when one is
+supplied, otherwise address-contiguous packs), a `<stem>_decls.h` /
+`<stem>_cu_prelude.h` pair, and a `_dispatch.c` address→function table. All
+of these are build artifacts and are **never hand-edited** — if the C is
+wrong, the fix is in the recompiler.
 
 GTE (the PS1 geometry coprocessor) instructions are emitted inline;
 COP0 kernel-mode instructions the BIOS needs are handled in codegen.

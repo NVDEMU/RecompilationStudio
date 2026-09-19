@@ -147,6 +147,8 @@ struct GeneratedFunction {
     std::string body;             // C code body
     std::string full_code;        // signature + body
     int line_count;               // Number of lines generated
+    uint32_t start_addr = 0;
+    uint32_t keep_together = 0;   // alias-group host; 0 = none
 };
 
 class CodeGenerator {
@@ -182,6 +184,15 @@ public:
     std::string generate_file(
         const std::vector<Function>& functions,
         const std::map<uint32_t, ControlFlowGraph>& cfgs);
+
+    // Split + translate every function. Also snapshots emitted_functions_ for
+    // the ranges manifest. Used by the modular compilation-unit writer.
+    std::vector<GeneratedFunction> generate_file_functions(
+        const std::vector<Function>& functions,
+        const std::map<uint32_t, ControlFlowGraph>& cfgs);
+
+    // Shared includes / unaligned helpers for every compilation unit.
+    std::string generate_prelude() const;
 
     // Generate the per-function code-range manifest consumed by the overlay
     // loader's per-entry validity hash (design §8). For each function, emits its

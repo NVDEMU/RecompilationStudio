@@ -2086,6 +2086,8 @@ GeneratedFunction CodeGenerator::generate_function(
 
     GeneratedFunction result;
     result.function_name = func.name;
+    result.start_addr = func.start_addr;
+    result.keep_together = func.alias_walk_lo;
     result.signature = fmt::format("void {}(CPUState* cpu)", func.name);
 
     // Widescreen auto cull (gated): detect the screen-extent reject signature so
@@ -2480,6 +2482,8 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
         const Function* a = aliases[i];
         GeneratedFunction gf;
         gf.function_name = a->name;
+        gf.start_addr = a->start_addr;
+        gf.keep_together = host;
         gf.signature = fmt::format("void {}(CPUState* cpu)", a->name);
         gf.body = fmt::format(
             "{{\n"
@@ -2601,10 +2605,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
     return results;
 }
 
-std::string CodeGenerator::generate_file(
-    const std::vector<Function>& functions,
-    const std::map<uint32_t, ControlFlowGraph>& cfgs) {
-
+std::string CodeGenerator::generate_prelude() const {
     std::stringstream ss;
 
     // File header
@@ -2656,7 +2657,7 @@ std::string CodeGenerator::generate_file(
     ss << " * addr is the effective (possibly unaligned) address.\n";
     ss << " * rt_value is the current value of the destination register.\n";
     ss << " */\n";
-    ss << "static uint32_t psx_lwl(CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
+    ss << "static inline uint32_t psx_lwl(CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
     ss << "    uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, reg_mask);  /* full load interlock */\n";
     ss << "    switch (addr & 3u) {\n";
     ss << "        case 0: return (rt_value & 0x00FFFFFFu) | (word << 24);\n";
@@ -2670,7 +2671,7 @@ std::string CodeGenerator::generate_file(
     ss << " * addr is the effective (possibly unaligned) address.\n";
     ss << " * rt_value is the current value of the destination register.\n";
     ss << " */\n";
-    ss << "static uint32_t psx_lwr(CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
+    ss << "static inline uint32_t psx_lwr(CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
     ss << "    uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, reg_mask);  /* full load interlock */\n";
     ss << "    switch (addr & 3u) {\n";
     ss << "        case 0: return word;\n";
@@ -2684,7 +2685,7 @@ std::string CodeGenerator::generate_file(
     ss << " * addr is the effective (possibly unaligned) address.\n";
     ss << " * rt_value is the value of the source register.\n";
     ss << " */\n";
-    ss << "static void psx_swl(CPUState* cpu, uint32_t addr, uint32_t rt_value) {\n";
+    ss << "static inline void psx_swl(CPUState* cpu, uint32_t addr, uint32_t rt_value) {\n";
     ss << "    uint32_t aligned_addr = addr & ~3u;\n";
     ss << "    uint32_t word = cpu->read_word(aligned_addr);\n";
     ss << "    switch (addr & 3u) {\n";
@@ -2700,7 +2701,7 @@ std::string CodeGenerator::generate_file(
     ss << " * addr is the effective (possibly unaligned) address.\n";
     ss << " * rt_value is the value of the source register.\n";
     ss << " */\n";
-    ss << "static void psx_swr(CPUState* cpu, uint32_t addr, uint32_t rt_value) {\n";
+    ss << "static inline void psx_swr(CPUState* cpu, uint32_t addr, uint32_t rt_value) {\n";
     ss << "    uint32_t aligned_addr = addr & ~3u;\n";
     ss << "    uint32_t word = cpu->read_word(aligned_addr);\n";
     ss << "    switch (addr & 3u) {\n";
@@ -2712,6 +2713,12 @@ std::string CodeGenerator::generate_file(
     ss << "    cpu->write_word(aligned_addr, word);\n";
     ss << "}\n";
     ss << "\n";
+    return ss.str();
+}
+
+std::vector<GeneratedFunction> CodeGenerator::generate_file_functions(
+    const std::vector<Function>& functions,
+    const std::map<uint32_t, ControlFlowGraph>& cfgs) {
 
     // Make mutable copies for potential function splitting
     std::vector<Function> functions_mut(functions);
@@ -2917,10 +2924,16 @@ std::string CodeGenerator::generate_file(
 
     set_known_functions(known_addrs);
 
-    // Generate all functions first (to collect names)
-    auto gen_funcs = generate_all_functions(functions_mut, cfgs_mut);
+    return generate_all_functions(functions_mut, cfgs_mut);
+}
 
-    // Forward declarations for all functions
+std::string CodeGenerator::generate_file(
+    const std::vector<Function>& functions,
+    const std::map<uint32_t, ControlFlowGraph>& cfgs) {
+
+    auto gen_funcs = generate_file_functions(functions, cfgs);
+    std::stringstream ss;
+    ss << generate_prelude();
     if (!gen_funcs.empty()) {
         ss << "/* Forward declarations */\n";
         for (const auto& gen_func : gen_funcs) {
@@ -2928,12 +2941,9 @@ std::string CodeGenerator::generate_file(
         }
         ss << "\n";
     }
-
-    // Function definitions
     for (const auto& gen_func : gen_funcs) {
         ss << gen_func.full_code << "\n";
     }
-
     return ss.str();
 }
 

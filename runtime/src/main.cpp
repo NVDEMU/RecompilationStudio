@@ -63,6 +63,10 @@
 #if defined(PSX_FRONTEND_UI)
 #include "launcher.h"
 #endif
+#if defined(PSX_NETPLAY)
+#include "psx_netplay.h"      /* two machines, one match — see the header */
+#include "overlay_api.h"      /* PSX_OVERLAY_CODEGEN_HASH, for the content digest */
+#endif
 #include <SDL.h>
 #include <algorithm>
 #include <cctype>
@@ -443,6 +447,13 @@ static bool          g_pause_allow_hybrid = true;
 static bool          g_pause_lock_mode = false;
 static bool          g_pause_lock_device = false;
 static int           g_pause_locked_mode = PSXRecompV4::PAD_MODE_ANALOG;
+#endif
+#if defined(PSX_NETPLAY)
+/* True once the Online client's session channel is open. Declared here because
+ * the input plumbing consults it long before the match code below: in a match
+ * the two guest ports belong to the session, not to whatever either player has
+ * plugged in. See the netplay block further down. */
+static bool          g_netplay_on = false;
 #endif
 
 /* SDL GL attributes must be set BEFORE creating the window. The launcher used
@@ -1111,6 +1122,12 @@ static void close_controller(void);
 
 extern "C" void overlay_compile_worker_stop(void);
 static void shutdown_runtime(void) {
+#if defined(PSX_NETPLAY)
+    /* Tell the opponent before the socket does. A player who closes the window
+     * mid-match has left it; the alternative is the other machine stalling for
+     * twelve seconds on someone who is already gone. */
+    if (g_netplay_on) psx_netplay_leave(PSX_NETPLAY_LEFT_QUIT);
+#endif
     overlay_compile_worker_stop();   /* signal + join the off-thread sljit worker */
     memcard_flush_all();
     overlay_capture_write_json();
@@ -1938,6 +1955,17 @@ static void refresh_player_devices(void) {
 
     for (int s = 0; s < 2; s++) {
         PlayerInput& p = g_players[s];
+#if defined(PSX_NETPLAY)
+        /* In a match both ports are always there, whatever either player has
+         * plugged in: the guest's pads belong to the session, and a controller
+         * unplugged on one machine must not change what that machine's guest
+         * sees — the other machine would carry on with two pads. */
+        if (g_netplay_on) {
+            sio_set_pad_connected(s, 1);
+            configure_sio_pad_mode(s, p);
+            continue;
+        }
+#endif
         const bool connected = player_physical_attached(p) ||
                                player_keyboard_fallback(p, s);
         sio_set_pad_connected(s, connected ? 1 : 0);
@@ -2394,88 +2422,107 @@ static void apply_input_override_to_sio(int override_word) {
     sio_request_pad_type(0, eff_analog);
 }
 
+/* Resolve one port's pad for this frame: the button word, the four stick axes,
+ * and whether the pad presents as analog. Returns 0 when the port holds no
+ * device at all, in which case there is nothing to push anywhere for it.
+ *
+ * Split out from sample_pad_into_sio because netplay needs the same answer for
+ * a different destination: the local player's pad goes on the wire, and what
+ * reaches SIO is what the session agreed, which is not the same thing. */
+static int sample_player_pad(int s, uint16_t* out_btn, uint8_t out_st[4],
+                             int* out_analog) {
+    PlayerInput& p = g_players[s];
+    const int  player  = s + 1;             /* keybinds.ini section (1|2) */
+    /* Dev input: P1 is driven by the keyboard AND every connected controller,
+     * so a tester can navigate from whatever is plugged in (P2 keeps strict
+     * per-port routing). */
+    const bool dev_here = (dev_any_input_enabled() && s == 0);
+    if (p.kind == 0 && !dev_here) return 0;  /* no device in this port */
+
+    if (s == 0) {
+        g_frontend_keyboard_pad = pad_from_keyboard(1);
+        g_frontend_physical_pad = physical_pad_buttons(p);
+        g_frontend_sdl_buttons = 0;
+        g_frontend_sdl_axes.fill(0);
+        if (p.handle && SDL_GameControllerGetAttached(p.handle)) {
+            for (int button = 0; button < SDL_CONTROLLER_BUTTON_MAX; ++button) {
+                if (SDL_GameControllerGetButton(
+                        p.handle, (SDL_GameControllerButton)button)) {
+                    g_frontend_sdl_buttons |= 1u << button;
+                }
+            }
+            for (int axis = 0; axis < SDL_CONTROLLER_AXIS_MAX; ++axis) {
+                g_frontend_sdl_axes[(size_t)axis] = SDL_GameControllerGetAxis(
+                    p.handle, (SDL_GameControllerAxis)axis);
+            }
+        }
+    }
+
+    /* Buttons: merge the assigned device with the keyboard (PSX pad word is
+     * active-low, so AND combines "pressed on either source"). In dev mode P1
+     * also folds in the keyboard binds and EVERY connected controller. */
+    uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player) : (uint16_t)0xFFFF;
+    if (player_uses_keyboard(p, player) || dev_here)
+        btn &= (uint16_t)~g_keyboard_edge_mask[s];
+    if (dev_here) {
+        btn &= pad_from_keyboard(1);           /* keyboard drives P1 binds     */
+        btn &= dev_all_controllers_buttons();  /* any plugged-in controller too */
+    }
+    if (s == 0) g_frontend_routed_pad = btn;
+    if (s == 0 && btn != g_frontend_last_pad) {
+        g_frontend_last_pad = btn;
+        frontend_input_trace_note(2, SDL_SCANCODE_UNKNOWN, 0, btn);
+    }
+
+    /* Resolve the pad type this frame. An assigned device keeps its configured
+     * mode (a launcher-selected analog DualShock stays analog, so its input
+     * path / SIO handshake cadence is preserved exactly). A P1 with no assigned
+     * device but dev-any-input on presents as HYBRID — boots analog like a
+     * DualShock and auto-drops to digital on the d-pad — so any plugged
+     * controller and the keyboard both navigate. */
+    int mode;
+    if (p.kind != 0)      mode = p.mode;
+    else if (dev_here)    mode = (int)PSXRecompV4::PAD_MODE_HYBRID;
+    else                  mode = (int)PSXRecompV4::PAD_MODE_DIGITAL;
+    mode = pad_mode_for_sampling(s, mode);
+    int eff_analog;
+    uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
+    if (mode == PSXRecompV4::PAD_MODE_DIGITAL) {
+        eff_analog = 0;
+    } else if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
+        eff_analog = 1;
+        pad_sticks_for(p, player, st, /*fold_dpad=*/true);
+    } else { /* HYBRID */
+        if (hybrid_stick_active(p))                       p.hybrid_analog = true;
+        else if (hybrid_dpad_active(p, player, dev_here)) p.hybrid_analog = false;
+        eff_analog = p.hybrid_analog ? 1 : 0;
+        if (eff_analog) pad_sticks_for(p, player, st, /*fold_dpad=*/false);
+    }
+    /* Dev mode: fold the keyboard's stick binds AND any connected controller's
+     * sticks onto the analog stick, so an analog-mode P1 steers from whatever
+     * is plugged in (P1 binds). */
+    if (dev_here && eff_analog) {
+        const Uint8* keys = host_keyboard_state();
+        psx_keybinds_sticks(keys, 1, st);
+        dev_any_controller_sticks(st);
+    }
+    *out_btn = btn;
+    out_st[0] = st[0]; out_st[1] = st[1]; out_st[2] = st[2]; out_st[3] = st[3];
+    *out_analog = eff_analog;
+    return 1;
+}
+
 static void sample_pad_into_sio(int override) {
     if (override >= 0) {
         apply_input_override_to_sio(override);
         return;
     }
     for (int s = 0; s < 2; s++) {
-        PlayerInput& p = g_players[s];
-        const int  player  = s + 1;             /* keybinds.ini section (1|2) */
-        /* Dev input: P1 is driven by the keyboard AND every connected controller,
-         * so a tester can navigate from whatever is plugged in (P2 keeps strict
-         * per-port routing). */
-        const bool dev_here = (dev_any_input_enabled() && s == 0);
-        if (p.kind == 0 && !dev_here) continue;  /* no device in this port */
-
-        if (s == 0) {
-            g_frontend_keyboard_pad = pad_from_keyboard(1);
-            g_frontend_physical_pad = physical_pad_buttons(p);
-            g_frontend_sdl_buttons = 0;
-            g_frontend_sdl_axes.fill(0);
-            if (p.handle && SDL_GameControllerGetAttached(p.handle)) {
-                for (int button = 0; button < SDL_CONTROLLER_BUTTON_MAX; ++button) {
-                    if (SDL_GameControllerGetButton(
-                            p.handle, (SDL_GameControllerButton)button)) {
-                        g_frontend_sdl_buttons |= 1u << button;
-                    }
-                }
-                for (int axis = 0; axis < SDL_CONTROLLER_AXIS_MAX; ++axis) {
-                    g_frontend_sdl_axes[(size_t)axis] = SDL_GameControllerGetAxis(
-                        p.handle, (SDL_GameControllerAxis)axis);
-                }
-            }
-        }
-
-        /* Buttons: merge the assigned device with the keyboard (PSX pad word is
-         * active-low, so AND combines "pressed on either source"). In dev mode P1
-         * also folds in the keyboard binds and EVERY connected controller. */
-        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player) : (uint16_t)0xFFFF;
-        if (player_uses_keyboard(p, player) || dev_here)
-            btn &= (uint16_t)~g_keyboard_edge_mask[s];
-        if (dev_here) {
-            btn &= pad_from_keyboard(1);           /* keyboard drives P1 binds     */
-            btn &= dev_all_controllers_buttons();  /* any plugged-in controller too */
-        }
-        if (s == 0) g_frontend_routed_pad = btn;
-        if (s == 0 && btn != g_frontend_last_pad) {
-            g_frontend_last_pad = btn;
-            frontend_input_trace_note(2, SDL_SCANCODE_UNKNOWN, 0, btn);
-        }
+        uint16_t btn = 0xFFFFu;
+        uint8_t  st[4] = { 0x80, 0x80, 0x80, 0x80 };
+        int      eff_analog = 0;
+        if (!sample_player_pad(s, &btn, st, &eff_analog)) continue;
         sio_set_pad_state_slot(s, btn);
-
-        /* Resolve the pad type this frame. An assigned device keeps its configured
-         * mode (a launcher-selected analog DualShock stays analog, so its input
-         * path / SIO handshake cadence is preserved exactly). A P1 with no assigned
-         * device but dev-any-input on presents as HYBRID — boots analog like a
-         * DualShock and auto-drops to digital on the d-pad — so any plugged
-         * controller and the keyboard both navigate. */
-        int mode;
-        if (p.kind != 0)      mode = p.mode;
-        else if (dev_here)    mode = (int)PSXRecompV4::PAD_MODE_HYBRID;
-        else                  mode = (int)PSXRecompV4::PAD_MODE_DIGITAL;
-        mode = pad_mode_for_sampling(s, mode);
-        int eff_analog;
-        uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
-        if (mode == PSXRecompV4::PAD_MODE_DIGITAL) {
-            eff_analog = 0;
-        } else if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
-            eff_analog = 1;
-            pad_sticks_for(p, player, st, /*fold_dpad=*/true);
-        } else { /* HYBRID */
-            if (hybrid_stick_active(p))                       p.hybrid_analog = true;
-            else if (hybrid_dpad_active(p, player, dev_here)) p.hybrid_analog = false;
-            eff_analog = p.hybrid_analog ? 1 : 0;
-            if (eff_analog) pad_sticks_for(p, player, st, /*fold_dpad=*/false);
-        }
-        /* Dev mode: fold the keyboard's stick binds AND any connected controller's
-         * sticks onto the analog stick, so an analog-mode P1 steers from whatever
-         * is plugged in (P1 binds). */
-        if (dev_here && eff_analog) {
-            const Uint8* keys = host_keyboard_state();
-            psx_keybinds_sticks(keys, 1, st);
-            dev_any_controller_sticks(st);
-        }
         /* Push sticks every frame; request the pad type (digital/analog) through
          * the coherent channel so a hybrid stick<->d-pad flip is applied only at
          * an idle, non-config bus boundary (never mid-poll / mid-handshake). This
@@ -2507,6 +2554,159 @@ static void sample_headless_pad_into_sio(int override) {
     sio_set_pad_state_slot(0, 0xFFFFu);
     sio_set_pad_state_slot(1, 0xFFFFu);
 }
+
+#if defined(PSX_NETPLAY)
+/* ---- Online match (psx_netplay.h) -----------------------------------------
+ *
+ * The runtime's side of a two-machine match is deliberately small. Everything
+ * that could differ between the two boxes is pinned before the BIOS runs (both
+ * ports present the pad the game asked for rather than whatever each player has
+ * plugged in, both memory cards are absent, and the local pad reaches the guest
+ * only through the session). The restart point is the complete machine snapshot
+ * taken the first time the guest reaches the game's entry PC. From the restart
+ * onwards, every frame's two pad words come from the session.
+ *
+ * Nothing below runs unless the Online client launched this process. */
+
+extern "C" uint8_t* memory_get_ram_ptr(void);
+
+static std::string g_netplay_reset_path;          /* the restart snapshot's file */
+static bool        g_netplay_capture_staged = false;
+
+/* savestate.c reports how an explicit-path request went: kind 1 is the capture
+ * of the restart point, kind 2 the restore that starts the match. */
+static void netplay_savestate_report(int kind, int ok) {
+    if (kind == 1)      psx_netplay_note_reset_point(ok);
+    else if (kind == 2) psx_netplay_note_reset_done(ok);
+}
+
+static void netplay_pin_pads_neutral(void) {
+    sio_set_pad_state_slot(0, 0xFFFFu);
+    sio_set_pad_state_slot(1, 0xFFFFu);
+}
+
+/* Wait out part of a stalled frame without letting the host decide the process
+ * has died. The guest is held inside this vblank callback exactly as the pause
+ * menu holds it, so CPU, timers, CD and SIO stop together: the machine stays a
+ * machine, it simply stops advancing until the opponent's input arrives.
+ * Returns false if the player closed the window while we waited. */
+static bool netplay_wait_a_moment(void) {
+    if (!g_headless) {
+        SDL_PumpEvents();            /* keep the OS happy — but do not drain the */
+        SDL_GameControllerUpdate();  /* queue; the outer vblank loop owns it     */
+        SDL_Event quit;
+        if (SDL_PeepEvents(&quit, 1, SDL_PEEKEVENT, SDL_QUIT, SDL_QUIT) > 0)
+            return false;
+    }
+    SDL_Delay(1);
+    return true;
+}
+
+/* The match's half of a vblank, run in place of the local pad sample. Returns
+ * true when the session owns the two guest ports this frame, in which case the
+ * caller must not sample local devices into SIO: what the guest sees has to be
+ * what both machines agreed on, not what is plugged into this one. */
+static bool netplay_vblank(void) {
+    if (!g_netplay_on) return false;
+    psx_netplay_update();
+
+    PsxNetplayStatus st;
+    psx_netplay_status(&st);
+
+    /* A match that is over — played out, abandoned, or one that could never
+     * start — gives the machine back. There is no reason to hold a single
+     * player's game hostage to a session that has finished with them. */
+    if (!st.active || std::strcmp(st.state, "finished") == 0 ||
+                      std::strcmp(st.state, "error") == 0)
+        return false;
+
+    /* Nothing this player does reaches the guest until the restart point
+     * exists. Both machines restore their own snapshot rather than trading one,
+     * so those snapshots have to be interchangeable — and a pad pressed during
+     * the boot logo is enough to make them differ. */
+    if (!st.reset_ready) {
+        netplay_pin_pads_neutral();
+        if (!g_netplay_capture_staged && fntrace_is_game_started()) {
+            g_netplay_capture_staged = true;
+            /* Executed at the next block-leader boundary, where cpu->pc is a
+             * valid resume PC, then reported through netplay_savestate_report.
+             * Both machines reach this guest instant identically. */
+            if (!savestate_request_save_path(g_netplay_reset_path.c_str()))
+                psx_netplay_note_reset_point(0);
+        }
+        return true;
+    }
+
+    /* Both machines restart on the same frame. A restore never returns: it
+     * unwinds to the scheduler and re-dispatches at the game's entry PC, so
+     * everything after this call is abandoned along with the guest stack. */
+    if (psx_netplay_take_reset_request()) {
+        netplay_pin_pads_neutral();
+        if (!savestate_request_load_path(g_netplay_reset_path.c_str()))
+            psx_netplay_note_reset_done(0);
+        return true;
+    }
+
+    if (!psx_netplay_running()) {
+        /* The window around the restart: the countdown, and the moment after
+         * this machine's restore while the opponent finishes theirs. Both
+         * machines have to sit still through it, or they arrive at frame 0 of
+         * the match from two different places. */
+        if (std::strcmp(st.state, "countdown") == 0 ||
+            std::strcmp(st.state, "restarting") == 0) {
+            netplay_pin_pads_neutral();
+            return true;
+        }
+        /* Otherwise there is simply no match yet — waiting for an opponent is
+         * no reason to take the game away from the person in front of it, and
+         * whatever they do now is discarded by the restart anyway. */
+        return false;
+    }
+
+    /* This player's own pad — their host player-1 device, whichever guest port
+     * the session gave them — goes on the wire; what comes back is the pair of
+     * ports both machines feed their guests this frame. */
+    uint16_t btn = 0xFFFFu;
+    uint8_t  axes[4] = { 0x80, 0x80, 0x80, 0x80 };
+    int      analog = 0;
+    if (!g_headless) sample_player_pad(0, &btn, axes, &analog);
+
+    PsxNetplayPads pads;
+    if (!psx_netplay_frame(btn, axes, &pads)) {
+        /* Stalled: the opponent's input for this frame has not arrived yet.
+         * Hold the machine here until it does. The pad word sent for this frame
+         * was recorded on the first call and is not re-read, so a button
+         * pressed during the wait belongs to a later frame on both machines. */
+        starvation_watchdog_pause();
+        bool cleared = false;
+        while (psx_netplay_running()) {
+            if (!netplay_wait_a_moment()) break;
+            psx_netplay_update();
+            if (psx_netplay_frame(btn, axes, &pads)) { cleared = true; break; }
+        }
+        starvation_watchdog_resume();
+        if (!cleared) return false;   /* the match ended while we waited */
+    }
+
+    for (int s = 0; s < 2; s++) {
+        sio_set_pad_state_slot(s, pads.buttons[s]);
+        sio_set_pad_sticks(s, pads.axes[s][0], pads.axes[s][1],
+                              pads.axes[s][2], pads.axes[s][3]);
+    }
+
+    /* About once a second, agree on what the machine looks like. Main RAM is
+     * where a divergence shows up first and cheapest to hash; catching it here
+     * means the match ends with an explanation instead of leaving two players
+     * in two different games. */
+    static unsigned s_since_checksum = 0;
+    if (++s_since_checksum >= 60) {
+        s_since_checksum = 0;
+        psx_netplay_submit_checksum(
+            crc32_compute(memory_get_ram_ptr(), 2u * 1024u * 1024u));
+    }
+    return true;
+}
+#endif /* PSX_NETPLAY */
 
 #if defined(PSX_SETTINGS_MENU)
 /* Run the shared RmlUi frontend in pause-menu mode on a short-lived GL window.
@@ -2988,8 +3188,18 @@ static void sdl_vblank_present(void) {
      * g_low_latency_input this early sample is re-done after the pacer wait
      * (below) for the interactive present path; it still covers the turbo /
      * FMV-skip paths that early-return before pacing. */
-    if (g_headless) sample_headless_pad_into_sio(override);
-    else            sample_pad_into_sio(override);
+#if defined(PSX_NETPLAY)
+    /* An Online match takes both ports over: the guest is fed what the session
+     * agreed, not what is plugged into this box. Before the match starts and
+     * after it ends this returns false and the ordinary sampler runs. */
+    const bool netplay_owns_pads = netplay_vblank();
+#else
+    const bool netplay_owns_pads = false;
+#endif
+    if (!netplay_owns_pads) {
+        if (g_headless) sample_headless_pad_into_sio(override);
+        else            sample_pad_into_sio(override);
+    }
 
     /* Latency ring: open this present cycle's slot, stamping when input was
      * sampled into SIO.  Always-on; queried via the debug server "latency". */
@@ -3145,7 +3355,7 @@ static void sdl_vblank_present(void) {
      * Refresh the device state and re-sample right before present so the next
      * CPU frame reads near-fresh input (the dominant input->photon cost on a
      * vsync-light box). Re-stamp the ring's input mark to measure from here. */
-    if (g_low_latency_input) {
+    if (g_low_latency_input && !netplay_owns_pads) {
         SDL_GameControllerUpdate();  /* refresh pad state after the wait */
         SDL_PumpEvents();            /* refresh keyboard state */
         sample_pad_into_sio(override);
@@ -3450,9 +3660,6 @@ static void sdl_vblank_present(void) {
 #endif
 }
 
-#if defined(PSX_VIRTUA)
-extern "C"
-#endif
 int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
@@ -4036,6 +4243,54 @@ int main(int argc, char** argv) {
         }
     }
 
+#if defined(PSX_NETPLAY)
+    /* Was this process launched by the Online client to play a match? Asked
+     * here, before the launcher and before any hardware is configured, because
+     * the answer changes both: the client has already chosen the game, the disc
+     * and the opponent, and a match pins the pads and the memory cards. */
+    if (psx_netplay_available()) {
+        char ver[32];
+        std::snprintf(ver, sizeof(ver), "cg%u-%08X",
+                      (unsigned)PSX_OVERLAY_CODEGEN_VER,
+                      (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+        g_netplay_on = psx_netplay_start("psxrecomp", ver);
+    }
+    if (g_netplay_on) {
+        std::atexit(psx_netplay_shutdown);
+        /* Both machines must present the guest the same two pads. The game's
+         * own declared mode is what both ports get; the second port is not the
+         * local box's second controller, it is the opponent. Hybrid is the one
+         * mode that cannot survive this — it flips between d-pad and stick from
+         * whatever the person holding the pad does, which is per-player by
+         * definition — so a match presents its analog half. Digital, analog and
+         * auto all pass through: auto is decided by the guest's own SIO
+         * negotiation, which runs identically on both machines. */
+        if (p1_mode == PSXRecompV4::PAD_MODE_HYBRID)
+            p1_mode = PSXRecompV4::PAD_MODE_ANALOG;
+        p2_mode = p1_mode;
+        /* Memory cards are per-player, and a game that reads one would diverge
+         * on the first read. A match runs with both slots empty; nothing the
+         * players did in single player is at stake, because the match restarts
+         * from the game's entry point anyway. */
+        memcard1_enabled = memcard2_enabled = false;
+        /* Enhancements that change what the GUEST computes cannot be left to
+         * local taste in a match: two machines that disagree on them are two
+         * different machines, and lockstep would discover that a few seconds
+         * in. Widescreen hands the GTE a different display aspect, so the
+         * geometry the game reads back differs; the FMV auto-skip writes into
+         * guest RAM and holds a button down. Both go off for the duration —
+         * neither is what the players came for. Everything else the settings
+         * offer (renderer, supersampling, filtering, frame interpolation) is
+         * downstream of the guest and stays exactly as each player likes it. */
+        g_auto_skip_fmv = 0;
+        g_video_aspect_num = 4;
+        g_video_aspect_den = 3;
+        std::fprintf(stdout,
+                     "psxrecomp: online match — pads pinned (mode %d, both ports), "
+                     "memory cards off, 4:3, no FMV skip\n", p1_mode);
+    }
+#endif
+
 #if defined(PSX_LAUNCHER)
     /* Integrated launcher: shown in its own GL window before the emulator
      * boots. Seeded with the effective settings (game.toml ∪ settings.toml);
@@ -4048,8 +4303,13 @@ int main(int argc, char** argv) {
      * --launcher forces it back on (mirrors snesrecomp's SkipLauncher / --launcher).
      * This removes the dismiss-the-launcher round-trip for scripted/debug runs. */
     const bool want_launcher =
-        force_launcher ||
-        (!std::getenv("PSX_NO_LAUNCHER") && !force_no_launcher && !skip_launcher_setting);
+#if defined(PSX_NETPLAY)
+        /* A match goes straight in. The Online client picked everything the
+         * launcher would ask about, and an opponent is already waiting. */
+        !g_netplay_on &&
+#endif
+        (force_launcher ||
+        (!std::getenv("PSX_NO_LAUNCHER") && !force_no_launcher && !skip_launcher_setting));
     if (want_launcher) {
         load_external_controller_mappings(argv[0]);
         configure_sdl_input_hints();
@@ -4284,6 +4544,13 @@ int main(int argc, char** argv) {
     set_player_device(g_players[0], p1_device, p1_mode);
     set_player_device(g_players[1], p2_device, p2_mode);
     for (int s = 0; s < 2; s++) {
+#if defined(PSX_NETPLAY)
+        if (g_netplay_on) {   /* both ports are the session's; see above */
+            sio_set_pad_connected(s, 1);
+            configure_sio_pad_mode(s, g_players[s]);
+            continue;
+        }
+#endif
         const bool keyboard = PSXRecompV4::host_route_uses_keyboard(
             g_players[s].kind, false, s);
         sio_set_pad_connected(s,
@@ -4652,6 +4919,40 @@ int main(int argc, char** argv) {
         savestate_configure(memcard_dir.string().c_str(),
                             memory_get_bios_checksum(), game_entry_pc);
     }
+
+#if defined(PSX_NETPLAY)
+    /* An Online match restarts from a snapshot of this machine at the game's
+     * entry point, so it needs the same integrity key the save states use and a
+     * file of its own next to them. Without an entry PC — a bare BIOS run —
+     * there is no such point and therefore no match to play. */
+    if (g_netplay_on) {
+        if (game_entry_pc != 0) {
+            char nm[64];
+            std::snprintf(nm, sizeof(nm), "online_%08X.pst", (unsigned)game_entry_pc);
+            g_netplay_reset_path = (memcard_dir / nm).string();
+            savestate_set_path_observer(netplay_savestate_report);
+            /* The digest is what stops two players on different discs, or on
+             * output from two different recompiler builds, from being paired at
+             * all: same game, different codegen is still two different
+             * machines, and lockstep would find that out three seconds in.
+             * The boot path is in there for the same reason — an HLE kernel and
+             * a real BIOS intro leave the guest's memory in different shapes,
+             * and the snapshot each machine takes is of whatever it booted. */
+            char digest[192];
+            std::snprintf(digest, sizeof(digest), "psx:%s:%08X:%08X:%08X:%s%c",
+                          game_id.empty() ? "unknown" : game_id.c_str(),
+                          (unsigned)game_entry_pc,
+                          (unsigned)memory_get_bios_checksum(),
+                          (unsigned)PSX_OVERLAY_CODEGEN_HASH,
+                          psx_bios_hle_backend_name(),
+                          psx_bios_hle_boot_skip_enabled() ? 's' : 'i');
+            psx_netplay_set_content(digest);
+            std::fprintf(stdout, "psxrecomp: online content %s\n", digest);
+        } else {
+            psx_netplay_note_reset_point(0);
+        }
+    }
+#endif
 
     /* Let memory subsystem see SR for cache-isolation checks. */
     memory_set_sr_ptr(&cpu.cop0[12]);

@@ -1,14 +1,8 @@
 #include "CueSheet.h"
 #include "DiscCatalog.h"
 #include "DiscInspector.h"
-#include "GbaSupport.h"
-#include "GuestAppSupport.h"
-#include "GuestCrypto.h"
 #include "PipelineSupport.h"
 #include "PipelineWorker.h"
-#include "SwitchNsp.h"
-#include "VitaPfs.h"
-#include "VitaPkg.h"
 
 #include "quazip.h"
 #include "quazipfile.h"
@@ -57,25 +51,6 @@ QByteArray directoryRecord(const QByteArray& name, quint32 lba, quint32 size, bo
   return record;
 }
 
-bool makeTestGba(const QString& path, QString& error) {
-  QByteArray rom(1 << 20, static_cast<char>(0xff));
-  qToLittleEndian<quint32>(0xEA00002Eu,
-                           reinterpret_cast<uchar*>(rom.data()));
-  for (int i = 4; i < 0xA0; ++i) rom[i] = static_cast<char>((i * 37 + 11) & 0xff);
-  std::memcpy(rom.data() + 0xA0, "STUDIO TEST ", 12);
-  std::memcpy(rom.data() + 0xAC, "TSTE", 4);
-  std::memcpy(rom.data() + 0xB0, "01", 2);
-  rom[0xB2] = static_cast<char>(0x96);
-  rom[0xB3] = 0;
-  rom[0xBC] = 0;
-  quint32 sum = 0x19;
-  for (int offset = 0xA0; offset <= 0xBC; ++offset)
-    sum += static_cast<uchar>(rom.at(offset));
-  rom[0xBD] = static_cast<char>((-static_cast<qint32>(sum)) & 0xff);
-  std::memcpy(rom.data() + 0x1000, "FLASH1M_V123", 12);
-  return psxstudio::writeBytes(path, rom, error);
-}
-
 bool makeTestDisc(const QString& path, QString& error) {
   constexpr int sectorSize = 2048;
   QByteArray image(24 * sectorSize, 0);
@@ -106,321 +81,10 @@ bool makeTestDisc(const QString& path, QString& error) {
   return psxstudio::writeBytes(path, image, error);
 }
 
-void putBe16(QByteArray& bytes, qsizetype at, quint16 value) {
-  qToBigEndian(value, reinterpret_cast<uchar*>(bytes.data() + at));
-}
-void putBe32(QByteArray& bytes, qsizetype at, quint32 value) {
-  qToBigEndian(value, reinterpret_cast<uchar*>(bytes.data() + at));
-}
-void putBe64(QByteArray& bytes, qsizetype at, quint64 value) {
-  qToBigEndian(value, reinterpret_cast<uchar*>(bytes.data() + at));
-}
-void putLe16(QByteArray& bytes, qsizetype at, quint16 value) {
-  qToLittleEndian(value, reinterpret_cast<uchar*>(bytes.data() + at));
-}
-void putLe32(QByteArray& bytes, qsizetype at, quint32 value) {
-  qToLittleEndian(value, reinterpret_cast<uchar*>(bytes.data() + at));
-}
-void putLe64(QByteArray& bytes, qsizetype at, quint64 value) {
-  qToLittleEndian(value, reinterpret_cast<uchar*>(bytes.data() + at));
-}
-
-QByteArray beBytes32(quint32 value) {
-  QByteArray bytes(4, 0);
-  putBe32(bytes, 0, value);
-  return bytes;
-}
-
-/* Sony's PSF blob, in the one form a Vita param.sfo uses: UTF-8 values. */
-QByteArray makeSonyPsf(const QList<QPair<QByteArray, QByteArray>>& values) {
-  QByteArray entries, keys, data;
-  for (const auto& pair : values) {
-    QByteArray entry(16, 0);
-    putLe16(entry, 0, static_cast<quint16>(keys.size()));
-    putLe16(entry, 2, 0x0204);  // UTF-8, NUL-terminated
-    QByteArray value = pair.second;
-    value += '\0';
-    const quint32 length = static_cast<quint32>(value.size());
-    const quint32 maxLength = (length + 3u) & ~3u;
-    value.append(static_cast<qsizetype>(maxLength - length), '\0');
-    putLe32(entry, 4, length);
-    putLe32(entry, 8, maxLength);
-    putLe32(entry, 12, static_cast<quint32>(data.size()));
-    entries += entry;
-    keys += pair.first;
-    keys += '\0';
-    data += value;
-  }
-  while (keys.size() % 4 != 0) keys += '\0';
-  QByteArray psf(20, 0);
-  std::memcpy(psf.data(), "\0PSF", 4);
-  putLe32(psf, 4, 0x00000101u);
-  putLe32(psf, 8, static_cast<quint32>(20 + entries.size()));
-  putLe32(psf, 12, static_cast<quint32>(20 + entries.size() + keys.size()));
-  putLe32(psf, 16, static_cast<quint32>(values.size()));
-  return psf + entries + keys + data;
-}
-
-/* An ET_SCE_RELEXEC ARM ELF32 head — the form vita2mvii loads. */
-QByteArray makeVitaModule() {
-  QByteArray elf(256, 0);
-  std::memcpy(elf.data(), "\x7f" "ELF", 4);
-  elf[4] = 1;  // ELFCLASS32
-  elf[5] = 1;  // little endian
-  elf[6] = 1;  // EV_CURRENT
-  putLe16(elf, 16, 0xFE04u);  // ET_SCE_RELEXEC
-  putLe16(elf, 18, 40u);      // EM_ARM
-  putLe32(elf, 20, 1u);
-  return elf;
-}
-
-/* A 0x200-byte SceNpDrmLicense, laid out at the offsets rif.h gives: version at
- * 0x00, aid at 0x08, content_id at 0x10 and the klicensee at 0x50. `key` empty
- * writes the all-zero key a licence never has; `version` 0xFFFF with no account
- * is the placeholder a package's own temp.bin carries. */
-QByteArray makeVitaLicense(const QByteArray& contentId,
-                           const QByteArray& key,
-                           quint16 version = 1,
-                           quint64 accountId = 0x0123456789ABCDEFull) {
-  QByteArray rif(0x200, 0);
-  qToLittleEndian<quint16>(version, rif.data());
-  qToLittleEndian<quint64>(accountId, rif.data() + 0x08);
-  std::memcpy(rif.data() + 0x10, contentId.constData(),
-              static_cast<size_t>(std::min<qsizetype>(contentId.size(), 0x30)));
-  if (!key.isEmpty()) {
-    std::memcpy(rif.data() + 0x50, key.constData(),
-                static_cast<size_t>(std::min<qsizetype>(key.size(), 0x10)));
-  }
-  return rif;
-}
-
-/* An unpacked title directory: what a dumped Vita application looks like on
- * disk. `encrypted` gives it the sce_pfs layer — the shape whose files cannot be
- * read without the title's licence — and `licence` puts one beside it. */
-bool makeVitaTitleDirectory(const QString& directory,
-                            bool encrypted,
-                            const QByteArray& licence,
-                            QString& error) {
-  const QByteArray psf = makeSonyPsf({
-    { "TITLE", "Studio Test Vita Dump" }, { "TITLE_ID", "PCST00002" },
-    { "CATEGORY", "gd" }, { "APP_VER", "01.00" },
-  });
-  QList<QPair<QString, QByteArray>> files{
-    { QStringLiteral("eboot.bin"), makeVitaModule() },
-    { QStringLiteral("sce_sys/param.sfo"), psf },
-    { QStringLiteral("sce_module/libc.suprx"), QByteArray(64, '\x11') },
-    { QStringLiteral("data.vfs"), QByteArray(4096, '\x22') },
-  };
-  if (encrypted) {
-    // A files.db head that is well-formed as far as the licence check reads it:
-    // the magic, an image spec of 1 (gamedata, which is what a game is) and a
-    // salt, so that a licence checked against it is rejected on the header
-    // signature — the behaviour under test — rather than on a malformed field.
-    QByteArray filesDb(0x400, 0);
-    std::memcpy(filesDb.data(), "SCENGPFS", 8);
-    putLe32(filesDb, 0x08, 5u);           // version
-    putLe16(filesDb, 0x0C, 1u);           // image spec: gamedata
-    putLe16(filesDb, 0x0E, 0u);           // key id
-    putLe32(filesDb, 0x10, 0x400u);       // page size
-    putLe32(filesDb, 0x1C, 0x5EEDF00Du);  // files salt
-    // A header_icv no derived secret will reproduce, which is the point.
-    std::memset(filesDb.data() + 0x4C, 0x5A, 0x14);
-    files.append({ QStringLiteral("sce_pfs/files.db"), filesDb });
-    files.append({ QStringLiteral("sce_pfs/unicv.db"), QByteArray(0x400, 0) });
-    files.append({ QStringLiteral("sce_pfs/pflist"), QByteArray("eboot.bin\t0\t\t2\t256\t0\n") });
-  }
-  if (!licence.isEmpty())
-    files.append({ QStringLiteral("sce_sys/package/work.bin"), licence });
-
-  for (const auto& file : files) {
-    const QString path = QDir(directory).filePath(file.first);
-    if (!QDir().mkpath(QFileInfo(path).absolutePath()) ||
-        !psxstudio::writeBytes(path, file.second, error)) {
-      if (error.isEmpty())
-        error = QStringLiteral("the test title directory could not be written");
-      return false;
-    }
-  }
-  return true;
-}
-
-/* A PSN package built the way a real one is: an item table, a name region and
- * the file data, all under one AES-128-CTR stream keyed from the package's own
- * riv and the type-2 package key. `ebootProtected` writes the pflist mark that
- * says eboot.bin is stored inside the PFS layer, which is the case Studio has
- * to refuse by name rather than open. */
-bool makeTestVitaPkg(const QString& path, bool ebootProtected, QString& error) {
-  struct Item { QByteArray name; QByteArray data; quint32 flags; };
-  const QByteArray module = makeVitaModule();
-  const QByteArray psf = makeSonyPsf({
-    { "TITLE", "Studio Test Vita" }, { "TITLE_ID", "PCST00001" },
-    { "CATEGORY", "gd" }, { "APP_VER", "01.00" },
-  });
-  QByteArray pflist;
-  pflist += "sce_sys\t0\tdir\t0\t0\t0\n";
-  pflist += "sce_sys/param.sfo\t0\tnenc\t1\t" + QByteArray::number(psf.size()) + "\t0\n";
-  pflist += "eboot.bin\t0\t";
-  if (!ebootProtected) pflist += "nenc";
-  pflist += "\t2\t" + QByteArray::number(module.size()) + "\t0\n";
-
-  const QList<Item> items{
-    { "sce_sys", {}, 4u },
-    { "sce_pfs", {}, 4u },
-    { "sce_sys/param.sfo", psf, 3u },
-    { "sce_pfs/pflist", pflist, 3u },
-    { "eboot.bin", module, 3u },
-  };
-  const qsizetype tableSize = items.size() * 32;
-  QByteArray names, blobs;
-  QList<quint32> nameOffsets;
-  QList<quint64> dataOffsets;
-  for (const Item& item : items) {
-    nameOffsets.append(static_cast<quint32>(tableSize + names.size()));
-    names += item.name;
-  }
-  const qsizetype blobsBase = tableSize + names.size();
-  for (const Item& item : items) {
-    dataOffsets.append(static_cast<quint64>(blobsBase + blobs.size()));
-    blobs += item.data;
-  }
-  QByteArray table(tableSize, 0);
-  for (qsizetype index = 0; index < items.size(); ++index) {
-    const qsizetype at = index * 32;
-    putBe32(table, at, nameOffsets.at(index));
-    putBe32(table, at + 4, static_cast<quint32>(items.at(index).name.size()));
-    putBe64(table, at + 8, dataOffsets.at(index));
-    putBe64(table, at + 16, static_cast<quint64>(items.at(index).data.size()));
-    putBe32(table, at + 24, items.at(index).flags);
-  }
-  QByteArray data = table + names + blobs;
-
-  const QByteArray riv = QByteArray::fromHex("000102030405060708090a0b0c0d0e0f");
-  // The type-2 package key, which is part of the format rather than a secret.
-  const QByteArray stream = psxstudio::crypto::aesEcbEncrypt(
-    QByteArray::fromHex("e31a70c9ce1dd72bf3c0622963f2eccb"), riv);
-  psxstudio::crypto::CtrStream cipher(stream, riv);
-  if (!cipher.isValid()) {
-    error = QStringLiteral("the test package cipher could not be prepared");
-    return false;
-  }
-  cipher.apply(data.data(), data.size());
-
-  QByteArray meta;
-  meta += beBytes32(2) + beBytes32(4) + beBytes32(0x15);          // PSVita game
-  meta += beBytes32(13) + beBytes32(8) + beBytes32(0) +
-          beBytes32(static_cast<quint32>(tableSize));             // item table at 0
-  const quint64 dataOffset = 0x100u + static_cast<quint64>(meta.size());
-
-  QByteArray header(0x100, 0);
-  std::memcpy(header.data(), "\x7f" "PKG", 4);
-  putBe16(header, 4, 1u);
-  putBe16(header, 6, 2u);  // PSVita
-  putBe32(header, 0x08, 0x100u);
-  putBe32(header, 0x0C, 2u);
-  putBe32(header, 0x10, static_cast<quint32>(meta.size()));
-  putBe32(header, 0x14, static_cast<quint32>(items.size()));
-  putBe64(header, 0x18, dataOffset + static_cast<quint64>(data.size()));
-  putBe64(header, 0x20, dataOffset);
-  putBe64(header, 0x28, static_cast<quint64>(data.size()));
-  const QByteArray contentId("EP0000-PCST00001_00-STUDIOTEST000001");
-  std::memcpy(header.data() + 0x30, contentId.constData(),
-              static_cast<size_t>(contentId.size()));
-  std::memcpy(header.data() + 0x70, riv.constData(), 16);
-  putBe32(header, 0xE4, 2u);
-  return psxstudio::writeBytes(path, header + meta + data, error);
-}
-
-/* A PFS0 archive: the container an NSP is. */
-QByteArray makePfs0(const QList<QPair<QByteArray, QByteArray>>& files) {
-  QByteArray stringTable, blobs;
-  QList<quint32> nameOffsets;
-  for (const auto& file : files) {
-    nameOffsets.append(static_cast<quint32>(stringTable.size()));
-    stringTable += file.first;
-    stringTable += '\0';
-  }
-  while (stringTable.size() % 0x10 != 0) stringTable += '\0';
-  QByteArray table(files.size() * 0x18, 0);
-  for (qsizetype index = 0; index < files.size(); ++index) {
-    const qsizetype at = index * 0x18;
-    putLe64(table, at, static_cast<quint64>(blobs.size()));
-    putLe64(table, at + 8, static_cast<quint64>(files.at(index).second.size()));
-    putLe32(table, at + 0x10, nameOffsets.at(index));
-    blobs += files.at(index).second;
-  }
-  QByteArray header(0x10, 0);
-  std::memcpy(header.data(), "PFS0", 4);
-  putLe32(header, 4, static_cast<quint32>(files.size()));
-  putLe32(header, 8, static_cast<quint32>(stringTable.size()));
-  return header + table + stringTable + blobs;
-}
-
-/* An NSP with the two files a package ships in the clear — the ticket and the
- * .cnmt.xml — and one NCA that is what an NCA always is here: bytes no key in
- * this test can open. */
-bool makeTestNsp(const QString& path, QString& error) {
-  const QByteArray programId("aabbccddeeff00112233445566778899");
-  QByteArray ticket(0x2C0, 0);
-  putLe32(ticket, 0, 0x00010004u);  // RSA-2048 SHA-256: body at 0x140
-  const QByteArray titleKey = QByteArray::fromHex("0f0e0d0c0b0a09080706050403020100");
-  const QByteArray rightsId = QByteArray::fromHex("01000000000010000000000000000003");
-  std::memcpy(ticket.data() + 0x140 + 0x40, titleKey.constData(), 16);
-  std::memcpy(ticket.data() + 0x140 + 0x160, rightsId.constData(), 16);
-  const QByteArray cnmt =
-    "<?xml version=\"1.0\"?>\n<ContentMeta>\n"
-    "  <Type>Application</Type>\n  <Id>0x0100000000001000</Id>\n"
-    "  <Content>\n    <Type>Program</Type>\n    <Id>" + programId +
-    "</Id>\n    <Size>4096</Size>\n  </Content>\n</ContentMeta>\n";
-  const QByteArray nca(4096, static_cast<char>(0x5A));
-  return psxstudio::writeBytes(
-    path,
-    makePfs0({ { rightsId.toHex() + ".tik", ticket },
-               { programId + ".nca", nca },
-               { programId + ".cnmt.xml", cnmt } }),
-    error);
-}
-
 } // namespace
 
 int main(int argc, char** argv) {
   QCoreApplication app(argc, argv);
-  if (argc >= 6 && QString::fromLocal8Bit(argv[1]) == QStringLiteral("--gba-pipeline-smoke")) {
-    psxstudio::PipelineRequest request;
-    request.system = psxstudio::SystemKind::GameBoyAdvance;
-    request.targetPlatform = psxstudio::hostTargetPlatform();
-    if (argc >= 7) {
-      request.targetPlatform = psxstudio::targetPlatformFromKey(QString::fromLocal8Bit(argv[6]));
-    }
-    const QString smokeMode = QString::fromLocal8Bit(argv[5]);
-    request.exportMode = smokeMode.startsWith(QStringLiteral("source"))
-      ? psxstudio::ExportMode::Source : psxstudio::ExportMode::Build;
-    request.romPath = QString::fromLocal8Bit(argv[2]);
-    request.biosPath = QString::fromLocal8Bit(argv[3]);
-    request.outputDirectory = QString::fromLocal8Bit(argv[4]);
-    request.frameworkRoot = QDir::cleanPath(
-      QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("../..")));
-    request.powerEngineRoot = qEnvironmentVariable("POWERENGINE_ROOT");
-    request.llvmRoot = qEnvironmentVariable("VIRTUA_LLVM_ROOT");
-    request.ghidraHome = qEnvironmentVariable("GHIDRA_HOME");
-    request.windowTitle = argc >= 8 ? QString::fromLocal8Bit(argv[7])
-                                    : QStringLiteral("GBA Studio Smoke");
-    request.exportAsZip = QString::fromLocal8Bit(argv[5]).endsWith(QStringLiteral("zip"));
-    request.overwriteOutput = true;
-    psxstudio::PipelineWorker worker;
-    bool ok = false;
-    QString failure;
-    QObject::connect(&worker, &psxstudio::PipelineWorker::logLine,
-                     [](const QString& line) { qInfo().noquote() << line; });
-    QObject::connect(&worker, &psxstudio::PipelineWorker::completed,
-                     [&](const QString& path) { ok = true; qInfo().noquote() << path; });
-    QObject::connect(&worker, &psxstudio::PipelineWorker::failed,
-                     [&](const QString& message, const QString& workspace) {
-                       failure = message + QStringLiteral("\n") + workspace;
-                     });
-    worker.run(request);
-    if (!ok) qCritical().noquote() << failure;
-    return ok ? 0 : 1;
-  }
   QTemporaryDir temp;
   check(temp.isValid(), QStringLiteral("temporary directory creation"));
   if (!temp.isValid()) {
@@ -428,6 +92,16 @@ int main(int argc, char** argv) {
   }
 
   QString error;
+  const QString fakeGhidraHome = QDir(temp.path()).filePath(QStringLiteral("ghidra"));
+  const QString fakeGhidraProperties =
+    QDir(fakeGhidraHome).filePath(QStringLiteral("Ghidra/application.properties"));
+#if defined(Q_OS_WIN)
+  const QString fakeGhidraLauncher =
+    QDir(fakeGhidraHome).filePath(QStringLiteral("support/analyzeHeadless.bat"));
+#else
+  const QString fakeGhidraLauncher =
+    QDir(fakeGhidraHome).filePath(QStringLiteral("support/analyzeHeadless"));
+#endif
   const QString fallbackIcns = QDir(temp.path()).filePath(QStringLiteral("fallback.icns"));
   check(psxstudio::createIcns(
           QStringLiteral(":/psxrecomp/studio/resources/psxrecomp-studio.svg"),
@@ -439,358 +113,6 @@ int main(int argc, char** argv) {
         QStringLiteral("PNG-backed ICNS fallback repairs iconutil failures"));
   fallbackIcnsFile.close();
 
-  const QString gbaPath = QDir(temp.path()).filePath(QStringLiteral("studio-test.gba"));
-  check(makeTestGba(gbaPath, error), error);
-  psxstudio::GbaDescription gbaDescription;
-  check(psxstudio::inspectGbaRom(gbaPath, gbaDescription, error) &&
-          gbaDescription.title == QStringLiteral("STUDIO TEST") &&
-          gbaDescription.gameCode == QStringLiteral("TSTE") &&
-          gbaDescription.entryTarget == 0x080000C0u &&
-          gbaDescription.headerBranchValid && gbaDescription.complementValid &&
-          gbaDescription.saveType == QStringLiteral("flash1m") &&
-          gbaDescription.warning.isEmpty(),
-        error.isEmpty() ? QStringLiteral("GBA ROM header inspection") : error);
-  QList<psxstudio::GbaCatalogEntry> gbaCatalog;
-  QStringList gbaWarnings;
-  check(psxstudio::scanGbaDirectory(temp.path(), gbaCatalog, gbaWarnings, error) &&
-          gbaCatalog.size() == 1 &&
-          gbaCatalog.constFirst().gameCode == QStringLiteral("TSTE"),
-        error.isEmpty() ? QStringLiteral("GBA batch directory scan") : error);
-  psxstudio::PipelineRequest gbaRequest;
-  gbaRequest.system = psxstudio::SystemKind::GameBoyAdvance;
-  gbaRequest.targetPlatform = psxstudio::TargetPlatform::MacOS;
-  gbaRequest.romPath = gbaPath;
-  gbaRequest.windowTitle = QStringLiteral("Studio Test Advance");
-  check(psxstudio::systemKindFromKey(QStringLiteral("GBA")) ==
-          psxstudio::SystemKind::GameBoyAdvance &&
-          psxstudio::systemKindKey(gbaRequest.system) == QStringLiteral("gba") &&
-          gbaRequest.toJson().value(QStringLiteral("system")).toString() ==
-            QStringLiteral("gba") &&
-          gbaRequest.toJson().value(QStringLiteral("rom_path")).toString() == gbaPath,
-        QStringLiteral("GBA request system and ROM serialization"));
-  const QString gbaMain = psxstudio::generatedGbaMainCpp(
-    QStringLiteral("Studio Test Advance"), QString(40, QLatin1Char('a')), 0x12345678u);
-  check(gbaMain.contains(QStringLiteral("parent_path().parent_path() / \"Resources\"")) &&
-          gbaMain.contains(QStringLiteral("--save-path")) &&
-          gbaMain.contains(QStringLiteral("GBARECOMP_ASSET_CACHE_DIR")) &&
-          gbaMain.contains(QStringLiteral("builtin_rom_sha1")),
-        QStringLiteral("generated GBA entry point resolves packaged resources and writable saves"));
-  const QString gbaToml = psxstudio::generatedGbaGameToml(
-    gbaRequest, gbaDescription, QString(40, QLatin1Char('a')), 0x12345678u,
-    QString(40, QLatin1Char('b')), 0x87654321u, false);
-  check(gbaToml.contains(QStringLiteral("path = \"bios/gba_bios.bin\"")) &&
-          gbaToml.contains(QStringLiteral("path = \"game/game.gba\"")) &&
-          gbaToml.contains(QStringLiteral("short_name = \"StudioTestAdvance\"")) &&
-          gbaToml.contains(QStringLiteral("hle = false")) &&
-          gbaToml.contains(QStringLiteral("shadow = false")) &&
-          gbaToml.contains(QStringLiteral("type = \"flash1m\"")),
-        QStringLiteral("generated GBA runtime configuration pins packaged inputs"));
-  // The runtime silently ignores keys it does not know, so an inert section
-  // would read as configuration that does something. Only keys gbarecomp
-  // actually dispatches on may appear.
-  for (const auto& inert : { QStringLiteral("[recompiler]"), QStringLiteral("[runtime]"),
-                             QStringLiteral("window_title"), QStringLiteral("entry_point"),
-                             QStringLiteral("debug_port"), QStringLiteral("interpreter") }) {
-    check(!gbaToml.contains(inert),
-          QStringLiteral("generated GBA game.toml omits the inert key %1").arg(inert));
-  }
-  const QString gbaHleToml = psxstudio::generatedGbaGameToml(
-    gbaRequest, gbaDescription, QString(40, QLatin1Char('a')), 0x12345678u,
-    QString(40, QLatin1Char('b')), 0x87654321u, true);
-  check(gbaHleToml.contains(QStringLiteral("hle = true")) &&
-          gbaHleToml.contains(QStringLiteral("hle_keep_intro = false")),
-        QStringLiteral("GBA boot skip selects the runtime HLE boot path"));
-  const QString gbaRecompilerToml = psxstudio::generatedGbaRecompilerToml(
-    gbaRequest, gbaDescription, QString(40, QLatin1Char('a')));
-  check(gbaRecompilerToml.contains(QStringLiteral("[program]")) &&
-          gbaRecompilerToml.contains(QStringLiteral("load_address = 0x08000000")) &&
-          gbaRecompilerToml.contains(QStringLiteral("entry_pc = 0x080000C0")) &&
-          gbaRecompilerToml.contains(
-            QStringLiteral("size = %1").arg(gbaDescription.romSize)) &&
-          gbaRecompilerToml.contains(QStringLiteral("[identity]")) &&
-          gbaRecompilerToml.contains(
-            QStringLiteral("sha1 = \"%1\"").arg(QString(40, QLatin1Char('a')))),
-        QStringLiteral("generated gba_recompile configuration pins the image it was derived from"));
-  const QString gbaCmake = psxstudio::generatedGbaProjectCMake(
-    gbaRequest, gbaDescription, QStringLiteral("Studio Test Advance"),
-    QStringLiteral("org.psxrecomp.gba.test"));
-  check(gbaCmake.contains(QStringLiteral("project(GeneratedGbaRecompPackage")) &&
-          gbaCmake.contains(QStringLiteral("generated/recompiled_*.cpp")) &&
-          gbaCmake.contains(QStringLiteral("generated/dispatch_table.cpp")) &&
-          gbaCmake.contains(QStringLiteral("generated_bios/bios_recompiled.cpp")) &&
-          gbaCmake.contains(QStringLiteral("add_subdirectory(gbarecomp")) &&
-          gbaCmake.contains(QStringLiteral("target_link_gbarecomp_runtime_stack")) &&
-          gbaCmake.contains(QStringLiteral("package_inputs/gba_bios.bin")) &&
-          gbaCmake.contains(QStringLiteral("add_custom_target(gba-runtime")) &&
-          gbaCmake.contains(QStringLiteral("steganos-package/gba-runtime")) &&
-          !gbaCmake.contains(QStringLiteral("GBA_CARGO")) &&
-          !gbaCmake.contains(QStringLiteral("add_executable(psx-runtime")),
-        QStringLiteral("generated GBA CMake compiles the recompiled cartridge and BIOS"));
-
-  // Vita and Horizon distribution containers. A .pkg and a .nsp are archives,
-  // and Studio opens them: the refusals below are about one named inner layer,
-  // never about the container being "encrypted".
-  const QString guestDir = QDir(temp.path()).filePath(QStringLiteral("guest-apps"));
-  check(QDir().mkpath(guestDir), QStringLiteral("guest application fixture directory"));
-  const QString openPkg = QDir(guestDir).filePath(QStringLiteral("studio-test.pkg"));
-  check(makeTestVitaPkg(openPkg, false, error), error);
-  psxstudio::GuestAppDescription vitaPackage;
-  check(psxstudio::inspectGuestApp(psxstudio::SystemKind::Vita, openPkg,
-                                   vitaPackage, error),
-        error.isEmpty() ? QStringLiteral("PKG inspection") : error);
-  check(vitaPackage.loadable() &&
-          vitaPackage.container == psxstudio::GuestContainer::VitaPkg &&
-          vitaPackage.arch == psxstudio::GuestArch::Arm32 &&
-          vitaPackage.containerTitle == QStringLiteral("Studio Test Vita") &&
-          vitaPackage.containerTitleId == QStringLiteral("PCST00001") &&
-          vitaPackage.suggestedTitle == QStringLiteral("Studio Test Vita") &&
-          vitaPackage.requiresExtraction &&
-          vitaPackage.executableName == QStringLiteral("eboot.bin") &&
-          vitaPackage.contents.size() == 5,
-        QStringLiteral("a PKG is opened: item table, param.sfo and a reachable eboot.bin"));
-  const QString vitaStage = QDir(temp.path()).filePath(QStringLiteral("vita-stage"));
-  QString stagedVita;
-  QStringList vitaStageLog;
-  check(psxstudio::stageGuestApp(vitaPackage, openPkg, vitaStage, stagedVita,
-                                 vitaStageLog, error),
-        error.isEmpty() ? QStringLiteral("PKG staging") : error);
-  QFile stagedVitaFile(stagedVita);
-  check(stagedVitaFile.open(QIODevice::ReadOnly) &&
-          stagedVitaFile.readAll() == makeVitaModule() &&
-          QFileInfo(QDir(vitaStage).filePath(
-            QStringLiteral("container/sce_sys/param.sfo"))).isFile(),
-        QStringLiteral("staging a PKG extracts eboot.bin and keeps what it was extracted from"));
-  stagedVitaFile.close();
-
-  const QString sealedPkg = QDir(guestDir).filePath(QStringLiteral("studio-sealed.pkg"));
-  check(makeTestVitaPkg(sealedPkg, true, error), error);
-  psxstudio::GuestAppDescription vitaSealed;
-  check(psxstudio::inspectGuestApp(psxstudio::SystemKind::Vita, sealedPkg,
-                                   vitaSealed, error),
-        error.isEmpty() ? QStringLiteral("sealed PKG inspection") : error);
-  check(!vitaSealed.loadable() &&
-          vitaSealed.refusal.contains(QStringLiteral("PFS")) &&
-          vitaSealed.refusal.contains(QStringLiteral("eboot.bin")) &&
-          vitaSealed.refusal.contains(QStringLiteral("pflist")) &&
-          vitaSealed.contents.size() == 5 &&
-          vitaSealed.containerTitle == QStringLiteral("Studio Test Vita"),
-        QStringLiteral("a PKG whose eboot.bin is inside the PFS layer is refused at that layer"));
-  // The scan queues the package it can open and reports the one it cannot,
-  // rather than passing both on to fail on the device.
-  QList<psxstudio::GuestCatalogEntry> vitaCatalog;
-  QStringList vitaWarnings;
-  check(psxstudio::scanGuestAppDirectory(psxstudio::SystemKind::Vita, guestDir,
-                                         vitaCatalog, vitaWarnings, error) &&
-          vitaCatalog.size() == 1 &&
-          vitaCatalog.constFirst().suggestedTitle == QStringLiteral("Studio Test Vita") &&
-          vitaWarnings.size() == 1,
-        error.isEmpty() ? QStringLiteral("Vita batch scan separates the openable package")
-                        : error);
-
-  // The other shape a Vita title arrives in: unpacked, as a directory. Studio
-  // takes it whether the directory or its eboot.bin is selected, and stages the
-  // whole title rather than the module alone — a Vita game is its sce_module
-  // libraries and its asset archives as much as its eboot.
-  const QString plainTitle = QDir(temp.path()).filePath(QStringLiteral("vita-dump-plain"));
-  check(makeVitaTitleDirectory(plainTitle, /*encrypted=*/false, {}, error), error);
-  for (const QString& selected : { plainTitle,
-                                   QDir(plainTitle).filePath(QStringLiteral("eboot.bin")) }) {
-    psxstudio::GuestAppDescription dump;
-    check(psxstudio::inspectGuestApp(psxstudio::SystemKind::Vita, selected, dump, error),
-          error.isEmpty() ? QStringLiteral("unpacked title inspection") : error);
-    check(dump.loadable() &&
-            dump.container == psxstudio::GuestContainer::VitaAppDir &&
-            dump.arch == psxstudio::GuestArch::Arm32 &&
-            dump.containerTitle == QStringLiteral("Studio Test Vita Dump") &&
-            dump.containerTitleId == QStringLiteral("PCST00002") &&
-            dump.requiresExtraction &&
-            dump.executableName == QStringLiteral("eboot.bin"),
-          QStringLiteral("an unpacked title is taken whether the directory or its "
-                         "eboot.bin is selected (%1)").arg(QFileInfo(selected).fileName()));
-    const QString stage = QDir(temp.path()).filePath(
-      QStringLiteral("vita-dump-stage-%1").arg(QFileInfo(selected).fileName()));
-    QString stagedDump;
-    QStringList dumpLog;
-    check(psxstudio::stageGuestApp(dump, selected, stage, stagedDump, dumpLog, error),
-          error.isEmpty() ? QStringLiteral("unpacked title staging") : error);
-    auto stagedFile = [&](const char* relative) {
-      return QFileInfo(QDir(stage).filePath(QString::fromLatin1(relative)));
-    };
-    QFile stagedModule(stagedDump);
-    check(stagedModule.open(QIODevice::ReadOnly) &&
-            stagedModule.readAll() == makeVitaModule() &&
-            stagedFile("data/eboot.bin").isFile() &&
-            stagedFile("data/sce_module/libc.suprx").size() == 64 &&
-            stagedFile("data/data.vfs").size() == 4096 &&
-            stagedFile("data/sce_sys/param.sfo").isFile(),
-          QStringLiteral("staging an unpacked title writes the whole title as data/, "
-                         "not the module alone"));
-    stagedModule.close();
-  }
-
-  // The same directory with its PFS layer and no licence anywhere. The klicensee
-  // is per title and ships only with the licence, so this must be refused by
-  // naming the title and where Studio looked — never opened with a guessed key.
-  const QString sealedTitle = QDir(temp.path()).filePath(QStringLiteral("vita-dump-sealed"));
-  check(makeVitaTitleDirectory(sealedTitle, /*encrypted=*/true, {}, error), error);
-  psxstudio::GuestAppDescription sealedDump;
-  check(psxstudio::inspectGuestApp(psxstudio::SystemKind::Vita, sealedTitle,
-                                   sealedDump, error),
-        error.isEmpty() ? QStringLiteral("sealed title inspection") : error);
-  check(!sealedDump.loadable() &&
-          sealedDump.container == psxstudio::GuestContainer::VitaAppDir &&
-          sealedDump.refusal.contains(QStringLiteral("PCST00002")) &&
-          sealedDump.refusal.contains(QStringLiteral("klicensee")) &&
-          sealedDump.refusal.contains(QStringLiteral("Studio looked in:")) &&
-          sealedDump.refusal.contains(sealedTitle),
-        QStringLiteral("a PFS title with no licence is refused by title and by where "
-                       "the licence was looked for"));
-
-  // A licence that is not this title's is found and then rejected at the header
-  // rather than used, which is what stops a wrong key producing megabytes of
-  // plausible garbage. The fixture's files.db is not really signed, so no
-  // licence can pass it — that every candidate is rejected on the signature is
-  // exactly the assertion.
-  const QByteArray strangerKey = QByteArray::fromHex("8fbcd6dc5431bcef411e61901efb5641");
-  const QString wrongTitle = QDir(temp.path()).filePath(QStringLiteral("vita-dump-wrong"));
-  check(makeVitaTitleDirectory(
-          wrongTitle, /*encrypted=*/true,
-          makeVitaLicense("UP0000-PCST99999_00-SOMEOTHERTITLE00", strangerKey), error),
-        error);
-  psxstudio::GuestAppDescription wrongDump;
-  check(psxstudio::inspectGuestApp(psxstudio::SystemKind::Vita, wrongTitle,
-                                   wrongDump, error),
-        error.isEmpty() ? QStringLiteral("wrong-licence title inspection") : error);
-  check(!wrongDump.loadable() &&
-          wrongDump.refusal.contains(QStringLiteral("none of them opens PCST00002")) &&
-          std::any_of(wrongDump.notes.cbegin(), wrongDump.notes.cend(),
-                      [](const QString& note) {
-                        return note.contains(QStringLiteral("rejected")) &&
-                               note.contains(QStringLiteral("PCST99999"));
-                      }),
-        QStringLiteral("a licence for another title is read, checked against this "
-                       "title's files.db header, and rejected by content id"));
-
-  // The two forms that are not licences at all, refused by name rather than
-  // carried forward as sixteen bytes that fail three steps later.
-  psxstudio::VitaLicense parsed;
-  check(!psxstudio::readVitaLicenseBlob(
-          makeVitaLicense("EP0000-PCST00003_00-PLACEHOLDER00000", {}, 0xFFFF, 0),
-          QStringLiteral("temp.bin"), parsed, error) &&
-          error.contains(QStringLiteral("placeholder")),
-        QStringLiteral("a package's temp.bin placeholder is refused as a placeholder"));
-  check(!psxstudio::readVitaLicenseBlob(
-          makeVitaLicense("EP0000-PCST00003_00-NOKEY00000000000", {}),
-          QStringLiteral("empty.rif"), parsed, error) &&
-          error.contains(QStringLiteral("all-zero key")),
-        QStringLiteral("an all-zero klicensee is refused"));
-  check(psxstudio::readVitaLicenseBlob(
-          makeVitaLicense("UP4040-PCST00002_00-STUDIOTEST000000", strangerKey),
-          QStringLiteral("work.bin"), parsed, error) &&
-          parsed.isValid() && parsed.klicensee == strangerKey &&
-          parsed.contentId == QStringLiteral("UP4040-PCST00002_00-STUDIOTEST000000") &&
-          parsed.fakeAccount,
-        QStringLiteral("a NoNpDrm work.bin is read: key, content id and marker account"));
-  check(!psxstudio::verifyVitaLicenseHeader(QByteArray(0x400, 0), parsed, error) &&
-          error.contains(QStringLiteral("not a files.db")),
-        QStringLiteral("a licence checked against something that is not a files.db "
-                       "is refused for that, not for the key"));
-
-  const QString nspPath = QDir(guestDir).filePath(QStringLiteral("studio-test.nsp"));
-  check(makeTestNsp(nspPath, error), error);
-  psxstudio::SwitchNspInfo nsp;
-  check(psxstudio::readSwitchNsp(nspPath, nsp, error),
-        error.isEmpty() ? QStringLiteral("NSP PFS0 walk") : error);
-  check(nsp.entries.size() == 3 &&
-          nsp.titleId == QStringLiteral("0x0100000000001000") &&
-          nsp.contentMetaType == QStringLiteral("Application") &&
-          nsp.programNca == QStringLiteral("aabbccddeeff00112233445566778899.nca") &&
-          nsp.rightsId.toHex() == QByteArrayLiteral("01000000000010000000000000000003") &&
-          nsp.encryptedTitleKey.size() == 16,
-        QStringLiteral("an NSP's plaintext tier is read with no key at all"));
-  // Whether a key file exists on this machine is not the test's business; that
-  // the second tier never fails silently is.
-  check(nsp.programDecrypted || !nsp.missingKeys.isEmpty(),
-        QStringLiteral("an NSP that cannot be decrypted names the key it wanted"));
-  psxstudio::GuestAppDescription horizonPackage;
-  check(psxstudio::inspectGuestApp(psxstudio::SystemKind::Horizon, nspPath,
-                                   horizonPackage, error),
-        error.isEmpty() ? QStringLiteral("NSP inspection") : error);
-  check(horizonPackage.container == psxstudio::GuestContainer::HorizonNsp &&
-          horizonPackage.contents.size() == 3 &&
-          horizonPackage.containerTitleId == QStringLiteral("0x0100000000001000") &&
-          !horizonPackage.loadable() &&
-          horizonPackage.refusal.contains(QStringLiteral("prod.keys")),
-        QStringLiteral("an NSP with no usable keys is refused by naming them, having read the rest"));
-  check(psxstudio::guestAppFileFilter(psxstudio::SystemKind::Vita)
-          .contains(QStringLiteral("*.pkg")) &&
-          psxstudio::guestAppFileFilter(psxstudio::SystemKind::Horizon)
-            .contains(QStringLiteral("*.nsp")),
-        QStringLiteral("the file dialogs offer the distribution containers"));
-
-  // The generated project has to carry the target that copies the staged data
-  // beside the runtime, and guest-runtime has to depend on it. Without that the
-  // export is correct on disk and the built package still ships a loader with
-  // nothing behind it — a Switch `main` is under 2% of its title.
-  for (const psxstudio::SystemKind guestSystem : { psxstudio::SystemKind::Vita,
-                                                   psxstudio::SystemKind::Horizon }) {
-    psxstudio::PipelineRequest guestRequest;
-    guestRequest.system = guestSystem;
-    guestRequest.targetPlatform = psxstudio::TargetPlatform::VirtuaArm;
-    guestRequest.windowTitle = QStringLiteral("Studio Guest");
-    const QString guestCmake = psxstudio::generatedGuestAppProjectCMake(
-      guestRequest, vitaPackage, QStringLiteral("StudioGuest"));
-    check(guestCmake.contains(QStringLiteral("package_inputs/data")) &&
-            guestCmake.contains(QStringLiteral(
-              "copy_directory \"${_GUEST_DATA}\" \"${_GUEST_STAGE}/data\"")) &&
-            guestCmake.contains(QStringLiteral("add_custom_target(guest-data")) &&
-            guestCmake.contains(QStringLiteral("add_dependencies(guest-runtime guest-data)")) &&
-            guestCmake.contains(QStringLiteral("add_dependencies(guest-runtime %1-stage)")
-                                  .arg(psxstudio::systemFrontEndName(guestSystem))),
-          QStringLiteral("the generated %1 project stages package_inputs/data as data/")
-            .arg(psxstudio::systemFrontEndName(guestSystem)));
-  }
-
-  // An export that produced no translation must stop the build rather than
-  // quietly ship an executable with nothing recompiled in it.
-  // A separate root: CMake's compiler probe drops *.bin files into its build
-  // tree, and the disc catalog scan below recurses. Sharing `temp` would make
-  // those probe artifacts look like PlayStation tracks.
-  QTemporaryDir gbaCmakeTemp;
-  check(gbaCmakeTemp.isValid(), QStringLiteral("gbarecomp CMake fixture root"));
-  const QString gbaProject =
-    QDir(gbaCmakeTemp.path()).filePath(QStringLiteral("generated-gbarecomp-project"));
-  const QString gbaBuild =
-    QDir(gbaCmakeTemp.path()).filePath(QStringLiteral("generated-gbarecomp-build"));
-  check(psxstudio::writeText(QDir(gbaProject).filePath(QStringLiteral("CMakeLists.txt")),
-                             gbaCmake, error) &&
-        QDir().mkpath(QDir(gbaProject).filePath(QStringLiteral("generated"))) &&
-        QDir().mkpath(QDir(gbaProject).filePath(QStringLiteral("package_inputs"))),
-        error.isEmpty() ? QStringLiteral("generated gbarecomp CMake fixture") : error);
-  QProcess gbaConfigure;
-  gbaConfigure.start(QStringLiteral("cmake"),
-    { QStringLiteral("-S"), gbaProject, QStringLiteral("-B"), gbaBuild,
-      QStringLiteral("-G"), QStringLiteral("Ninja"),
-      QStringLiteral("-DCMAKE_BUILD_TYPE=Release") });
-  const bool gbaConfigureRan = gbaConfigure.waitForStarted(5000) &&
-                               gbaConfigure.waitForFinished(30000) &&
-                               gbaConfigure.exitStatus() == QProcess::NormalExit;
-  const QString gbaConfigureError = QString::fromUtf8(gbaConfigure.readAllStandardError());
-  check(gbaConfigureRan && gbaConfigure.exitCode() != 0 &&
-          gbaConfigureError.contains(QStringLiteral("no recompiled translation units")),
-        QStringLiteral("generated gbarecomp CMake refuses an empty translation: %1")
-          .arg(gbaConfigureError));
-
-  const QString fakeGhidraHome = QDir(temp.path()).filePath(QStringLiteral("ghidra"));
-  const QString fakeGhidraProperties =
-    QDir(fakeGhidraHome).filePath(QStringLiteral("Ghidra/application.properties"));
-#if defined(Q_OS_WIN)
-  const QString fakeGhidraLauncher =
-    QDir(fakeGhidraHome).filePath(QStringLiteral("support/analyzeHeadless.bat"));
-#else
-  const QString fakeGhidraLauncher =
-    QDir(fakeGhidraHome).filePath(QStringLiteral("support/analyzeHeadless"));
-#endif
   check(psxstudio::writeText(fakeGhidraProperties, QStringLiteral("application.name=Ghidra"), error),
         error);
   check(psxstudio::writeText(fakeGhidraLauncher, QStringLiteral("launcher"), error), error);
@@ -1091,56 +413,6 @@ int main(int argc, char** argv) {
           psxstudio::hostCanSelectTargetPlatform(),
         QStringLiteral("All is available only on macOS Studio builds"));
 
-  /* The platform drives the systems and nothing asks the reverse question.
-   * Virtua ARM is the only ARMv7 platform, so it is the only one that offers
-   * the two direct-execution guests; every platform offers the two recompiled
-   * systems, whose output is C. */
-  check(psxstudio::systemsForTargetPlatform(psxstudio::TargetPlatform::VirtuaArm) ==
-          QList<psxstudio::SystemKind>{ psxstudio::SystemKind::PlayStation,
-                                        psxstudio::SystemKind::GameBoyAdvance,
-                                        psxstudio::SystemKind::Vita,
-                                        psxstudio::SystemKind::Horizon },
-        QStringLiteral("Virtua ARM offers the Vita and Nintendo Switch systems"));
-  const QList<psxstudio::TargetPlatform> desktopPlatforms{
-    psxstudio::TargetPlatform::All, psxstudio::TargetPlatform::MacOS,
-    psxstudio::TargetPlatform::Windows, psxstudio::TargetPlatform::Linux };
-  bool desktopOffersRecompiledOnly = true;
-  for (const auto platform : desktopPlatforms) {
-    desktopOffersRecompiledOnly = desktopOffersRecompiledOnly &&
-      psxstudio::systemsForTargetPlatform(platform) ==
-        QList<psxstudio::SystemKind>{ psxstudio::SystemKind::PlayStation,
-                                      psxstudio::SystemKind::GameBoyAdvance } &&
-      !psxstudio::targetPlatformRunsSystem(platform, psxstudio::SystemKind::Vita) &&
-      !psxstudio::targetPlatformRunsSystem(platform, psxstudio::SystemKind::Horizon);
-  }
-  check(desktopOffersRecompiledOnly,
-        QStringLiteral("x86_64 platforms offer only the recompiled systems"));
-  /* The invariant that lets the export read the platform alone: every target a
-   * platform expands into runs every system that platform put on offer. */
-  bool everyTargetRunsItsSystems = true;
-  QList<psxstudio::TargetPlatform> everyPlatform = desktopPlatforms;
-  everyPlatform.append(psxstudio::TargetPlatform::VirtuaArm);
-  for (const auto platform : everyPlatform) {
-    for (const auto system : psxstudio::systemsForTargetPlatform(platform)) {
-      for (const auto target : psxstudio::concreteTargetPlatforms(platform)) {
-        everyTargetRunsItsSystems = everyTargetRunsItsSystems &&
-          psxstudio::targetPlatformRunsSystem(target, system);
-      }
-    }
-  }
-  check(everyTargetRunsItsSystems,
-        QStringLiteral("every expanded target runs every system its platform offers"));
-  check(psxstudio::defaultSystemForTargetPlatform(psxstudio::TargetPlatform::VirtuaArm) ==
-            psxstudio::SystemKind::PlayStation &&
-          psxstudio::defaultSystemForTargetPlatform(psxstudio::TargetPlatform::MacOS) ==
-            psxstudio::SystemKind::PlayStation &&
-          psxstudio::systemKindFromKey(QStringLiteral("switch")) ==
-            psxstudio::SystemKind::Horizon &&
-          psxstudio::systemKindDisplayName(psxstudio::SystemKind::Horizon) ==
-            QStringLiteral("Nintendo Switch") &&
-          psxstudio::systemKindDisplayName(psxstudio::SystemKind::Vita) ==
-            QStringLiteral("PlayStation Vita"),
-        QStringLiteral("leaving Virtua ARM falls back to the PlayStation"));
   gipRequest.targetPlatform = psxstudio::TargetPlatform::Windows;
   check(psxstudio::targetPlatformKey(gipRequest.targetPlatform) == QStringLiteral("windows") &&
           psxstudio::targetPlatformFromKey(QStringLiteral("WINDOWS")) ==
@@ -1159,28 +431,6 @@ int main(int argc, char** argv) {
         QStringLiteral("Linux platform selection round-trips through the request"));
 
 
-  gipRequest.targetPlatform = psxstudio::TargetPlatform::VirtuaArm;
-  gipRequest.exportMode = psxstudio::ExportMode::Build;
-  gipRequest.exportAsZip = true;
-  gipRequest.powerEngineRoot = QStringLiteral("/host-only/PowerEngine");
-  gipRequest.llvmRoot = QStringLiteral("/host-only/PowerEngine/compiler");
-  check(psxstudio::targetPlatformFromKey(QStringLiteral("VIRTUA-ARM")) ==
-          psxstudio::TargetPlatform::VirtuaArm &&
-          psxstudio::targetPlatformDisplayName(gipRequest.targetPlatform) ==
-            QStringLiteral("Virtua ARM") &&
-          psxstudio::exportOutputName(gipRequest) ==
-            QStringLiteral("Evil Zone (Europe)-Virtua-ARM.zip") &&
-          psxstudio::gameManifestForRequest(gipRequest)
-            .value(QStringLiteral("executable")).toString() ==
-              QStringLiteral("Evil Zone (Europe).virtua") &&
-          psxstudio::gameManifestForRequest(gipRequest)
-            .value(QStringLiteral("icon")).toString() == QStringLiteral("AppIcon.png") &&
-          gipRequest.toJson().value(QStringLiteral("powerengine_root")).toString() ==
-            gipRequest.powerEngineRoot &&
-          gipRequest.toJson().value(QStringLiteral("llvm_root")).toString() ==
-            gipRequest.llvmRoot,
-        QStringLiteral("Virtua ARM platform, output, and manifest round-trip"));
-
   psxstudio::GameDescription generatedGame;
   generatedGame.bootFileName = QStringLiteral("SLUS_000.00");
   generatedGame.serial = QStringLiteral("SLUS-00000");
@@ -1189,12 +439,9 @@ int main(int argc, char** argv) {
   generatedRequest.windowTitle = QStringLiteral("Portable Test Game");
   generatedRequest.macosGipGamepad = false;
   generatedRequest.frameworkRoot = QStringLiteral("/host-only/framework-root");
-  generatedRequest.powerEngineRoot = QStringLiteral("/host-only/PowerEngine");
-  generatedRequest.llvmRoot = QStringLiteral("/host-only/PowerEngine/compiler");
   for (const auto platform : { psxstudio::TargetPlatform::MacOS,
                                psxstudio::TargetPlatform::Windows,
-                               psxstudio::TargetPlatform::Linux,
-                               psxstudio::TargetPlatform::VirtuaArm }) {
+                               psxstudio::TargetPlatform::Linux }) {
     generatedRequest.targetPlatform = platform;
     const QString generatedCmake = psxstudio::generatedProjectCMake(
       generatedRequest, generatedGame, QStringLiteral("Portable Test Game"),
@@ -1207,21 +454,14 @@ int main(int argc, char** argv) {
             "copy_if_different \"${_PSX_GAME_MANIFEST}\"")) &&
           generatedCmake.contains(QStringLiteral(
             "${CMAKE_CURRENT_SOURCE_DIR}/framework")) &&
+          generatedCmake.contains(QStringLiteral("SCPH1001_cu_*.c")) &&
+          generatedCmake.contains(QStringLiteral("SLUS_000.00_cu_*.c")) &&
           !generatedCmake.contains(generatedRequest.frameworkRoot),
           QStringLiteral("generated CMake is portable and stages the game manifest during the target build"));
     if (platform == psxstudio::TargetPlatform::Linux) {
       check(generatedCmake.contains(QStringLiteral(
               "INTERFACE_INCLUDE_DIRECTORIES \"${sdl2source_SOURCE_DIR}/include\")\nset(SDL2_INCLUDE_DIRS")),
             QStringLiteral("generated Linux CMake closes imported SDL target properties"));
-    } else if (platform == psxstudio::TargetPlatform::VirtuaArm) {
-      check(generatedCmake.contains(QStringLiteral("set(PSX_VIRTUA ON")) &&
-              generatedCmake.contains(QStringLiteral("${POWERENGINE_ROOT}/External/Virtua")) &&
-              !generatedCmake.contains(QStringLiteral("framework/extra/virtua/binary")) &&
-              !generatedCmake.contains(generatedRequest.powerEngineRoot) &&
-              !generatedCmake.contains(generatedRequest.llvmRoot) &&
-              generatedCmake.contains(QStringLiteral("-scheduler cooperative")) &&
-              generatedCmake.contains(QStringLiteral("Portable Test Game.virtua")),
-            QStringLiteral("generated PlayStation CMake consumes external PowerEngine bindings"));
     }
   }
 
@@ -1230,8 +470,22 @@ int main(int argc, char** argv) {
   const QString macProject = QDir(temp.path()).filePath(QStringLiteral("generated-cmake-project"));
   const QString macBuild = QDir(temp.path()).filePath(QStringLiteral("generated-cmake-build"));
   check(QDir().mkpath(QDir(macProject).filePath(QStringLiteral("framework/runtime"))) &&
-          QDir().mkpath(QDir(macProject).filePath(QStringLiteral("package-resources"))),
+          QDir().mkpath(QDir(macProject).filePath(QStringLiteral("package-resources"))) &&
+          QDir().mkpath(QDir(macProject).filePath(QStringLiteral("generated/bios"))),
         QStringLiteral("generated CMake fixture directories"));
+  check(psxstudio::writeText(
+          QDir(macProject).filePath(QStringLiteral("generated/bios/SCPH1001_cu_000_stub.c")),
+          QStringLiteral("void psx_bios_stub(void) {}\n"), error) &&
+        psxstudio::writeText(
+          QDir(macProject).filePath(QStringLiteral("generated/SLUS_000.00_cu_000_stub.c")),
+          QStringLiteral("void psx_game_stub(void) {}\n"), error) &&
+        psxstudio::writeText(
+          QDir(macProject).filePath(QStringLiteral("generated/bios/SCPH1001_dispatch.c")),
+          QStringLiteral("void psx_bios_dispatch(void) {}\n"), error) &&
+        psxstudio::writeText(
+          QDir(macProject).filePath(QStringLiteral("generated/SLUS_000.00_dispatch.c")),
+          QStringLiteral("void psx_game_dispatch(void) {}\n"), error),
+        error);
   const QString runtimeStub = QStringLiteral(
     "function(psxrecomp_add_runtime_target target)\n"
     "  cmake_parse_arguments(PSXRT \"MACOSX_BUNDLE\" \"\" \"\" ${ARGN})\n"
@@ -1480,129 +734,6 @@ int main(int argc, char** argv) {
           packageSource, {}, cancelledZip, error, {}, []() { return true; }) &&
           !QFileInfo::exists(cancelledZip),
         QStringLiteral("cancelled package ZIP is not delivered"));
-
-  // ── Ghidra seed admission ──────────────────────────────────────────────────
-  //
-  // These guard the rule that keeps compressed art out of the dispatch table.
-  // Seeding on Ghidra's reference class instead admits data: on Final Fantasy
-  // VI Advance it offers 113,516 COMPUTED_CALL references against 22 real
-  // COMPUTED_JUMP, and because every admitted seed widens the translated extent
-  // that the next pass anchors to, the run cascades — 834,559 dispatch rows and
-  // 1.5 GB of generated C++ by pass 11, against 16,129 rows at the fixed point.
-  {
-    constexpr quint32 kRomBase = 0x08000000u;
-    const QString generatedDir = QDir(temp.path()).filePath(QStringLiteral("gba-generated"));
-    check(QDir().mkpath(generatedDir), QStringLiteral("seed-admission fixture directory"));
-
-    // A THUMB BL is two halfwords and gba_recompile lowers it as a `bl.hi`/
-    // `bl.lo` pair, so 0x08000102 is a complete call and 0x08000108 — sitting
-    // behind a `bx`, not a `bl.hi` — is an orphan second halfword. Ghidra turns
-    // exactly that shape into a call through LR with an invented destination.
-    QByteArray rom(0x400, '\0');
-    const auto pokeHalf = [&rom](quint32 address, quint16 value) {
-      qToLittleEndian(value, reinterpret_cast<uchar*>(rom.data()) + (address - kRomBase));
-    };
-    const auto pokeWord = [&rom](quint32 address, quint32 value) {
-      qToLittleEndian(value, reinterpret_cast<uchar*>(rom.data()) + (address - kRomBase));
-    };
-    pokeHalf(0x08000100u, 0xF000u);  // BL, upper half
-    pokeHalf(0x08000102u, 0xF87Eu);  // BL, lower half -> 0x08000200
-    pokeWord(0x08000130u, 0x08000601u);  // a THUMB function pointer
-
-    QString shard = QStringLiteral(
-      "/* 0x08000100  mode=thumb  end=0x08000140  branches=3 */\n"
-      "void gf_tfunc_08000100(void) {\n"
-      "    /* 08000100  08000100 T bl.hi 0x08000104 */\n"
-      "    /* 08000102  08000102 T bl.lo 0x00000000 */\n"
-      "    /* 08000104  08000104 T b 0x08000120 */\n"
-      "    /* 08000106  08000106 T bx r3 */\n"
-      "    /* 08000108  08000108 T bl.lo 0x00000000 */\n"
-      "    /* 0800010A  0800010a T movs r0,r0 */\n"
-      "}\n");
-    check(psxstudio::writeText(
-            QDir(generatedDir).filePath(QStringLiteral("recompiled_000.cpp")), shard, error),
-          error);
-
-    QSet<quint32> wanted;
-    for (quint32 address = 0x080000FEu; address <= 0x08000140u; address += 1) {
-      wanted.insert(address);
-    }
-    QList<psxstudio::GbaTranslatedSpan> spans;
-    psxstudio::GbaInstructionMap instructions;
-    check(psxstudio::readGbaTranslation(generatedDir, &wanted, spans, instructions, error) &&
-            spans.size() == 1 && instructions.size() == 6 &&
-            psxstudio::gbaTranslatedBytes(spans) == 0x40u &&
-            psxstudio::gbaSpanContaining(spans, 0x08000102u) != nullptr &&
-            psxstudio::gbaSpanContaining(spans, 0x08000140u) == nullptr,
-          error.isEmpty() ? QStringLiteral("gbarecomp shard spans and instructions parse")
-                          : error);
-
-    // The pre-Ghidra read: extents only, because the extents are what Ghidra is
-    // about to be handed and nothing has cited an address yet.
-    QList<psxstudio::GbaTranslatedSpan> extentSpans;
-    psxstudio::GbaInstructionMap noInstructions;
-    check(psxstudio::readGbaTranslation(generatedDir, nullptr, extentSpans, noInstructions,
-                                        error) &&
-            extentSpans.size() == 1 && noInstructions.isEmpty(),
-          error.isEmpty() ? QStringLiteral("a null cited-source set reads extents alone")
-                          : error);
-    check(psxstudio::gbaExtentsTable(extentSpans)
-            .endsWith(QStringLiteral("0x08000100\t0x08000140\tthumb\n")),
-          QStringLiteral("the extents table names each span with its instruction set"));
-
-    const auto candidate = [](quint32 entry, bool thumb, const QVector<quint32>& computed,
-                              const QVector<quint32>& pointers = {}) {
-      psxstudio::GbaSeedCandidate value;
-      value.entry = entry;
-      value.thumb = thumb;
-      value.name = QStringLiteral("fixture");
-      value.computedSources = computed;
-      value.pointerSources = pointers;
-      return value;
-    };
-    const auto admit = [&](const psxstudio::GbaSeedCandidate& value, QString& rule,
-                           bool& modeCrossed, QString& reason) {
-      quint32 evidence = 0;
-      rule.clear();
-      reason.clear();
-      modeCrossed = false;
-      return psxstudio::admitGbaSeed(value, spans, instructions, rom, kRomBase,
-                                     rule, evidence, modeCrossed, reason);
-    };
-
-    QString rule;
-    QString reason;
-    bool modeCrossed = false;
-    check(admit(candidate(0x08000200u, true, { 0x08000102u }), rule, modeCrossed, reason) &&
-            rule == QStringLiteral("direct-branch") && !modeCrossed,
-          QStringLiteral("a complete BL pair resolving to the entry is admitted"));
-    check(admit(candidate(0x08000120u, true, { 0x08000104u }), rule, modeCrossed, reason) &&
-            rule == QStringLiteral("direct-branch"),
-          QStringLiteral("a direct B printing the entry as its target is admitted"));
-    check(admit(candidate(0x08000400u, false, { 0x08000106u }), rule, modeCrossed, reason) &&
-            rule == QStringLiteral("register-indirect") && modeCrossed,
-          QStringLiteral("a BX admits either instruction set and reports the crossing"));
-    check(admit(candidate(0x08000600u, true, {}, { 0x08000130u }), rule, modeCrossed, reason) &&
-            rule == QStringLiteral("pointer-word"),
-          QStringLiteral("a ROM word holding entry|1 is admitted as a THUMB pointer"));
-
-    check(!admit(candidate(0x08000300u, true, { 0x08000108u }), rule, modeCrossed, reason) &&
-            reason.contains(QStringLiteral("orphan bl.lo")),
-          QStringLiteral("an orphan bl.lo is rejected: its destination is unknown"));
-    check(!admit(candidate(0x08000500u, true, { 0x08000109u }), rule, modeCrossed, reason),
-          QStringLiteral("an address inside a span but off the instruction boundary is rejected"));
-    check(!admit(candidate(0x08000200u, false, { 0x08000102u }), rule, modeCrossed, reason) &&
-            reason.contains(QStringLiteral("no BLX")),
-          QStringLiteral("a direct branch cannot enter its target in the other instruction set"));
-    check(!admit(candidate(0x08000700u, true, { 0x08000104u }), rule, modeCrossed, reason),
-          QStringLiteral("a direct branch resolving elsewhere does not seed this entry"));
-    check(!admit(candidate(0x08000800u, true, { 0x08009000u }), rule, modeCrossed, reason) &&
-            reason.isEmpty(),
-          QStringLiteral("a source outside every translated extent is unsupported, not contradicted"));
-    check(!admit(candidate(0x08000900u, true, {}, { 0x08000130u }), rule, modeCrossed, reason) &&
-            reason.contains(QStringLiteral("holds")),
-          QStringLiteral("a pointer word holding some other address is rejected"));
-  }
 
   if (failures == 0) {
     qInfo() << "PSXRecomp Studio core tests passed";

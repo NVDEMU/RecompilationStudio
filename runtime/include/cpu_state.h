@@ -5,7 +5,7 @@
  * layout as generated/cpu_state.h (Phase 1a compile-only artifact) but is
  * intended to be linked into a runnable binary.
  *
- * The generated C files (SCPH1001_full.c, SCPH1001_dispatch.c) include
+ * The generated C files (SCPH1001_cu_*.c, SCPH1001_dispatch.c) include
  * "cpu_state.h" and the build uses -I runtime/include so they find this file.
  * ========================================================================== */
 

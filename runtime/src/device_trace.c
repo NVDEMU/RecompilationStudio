@@ -4,11 +4,7 @@
 #include "device_trace.h"
 #include <string.h>
 
-#if defined(PSX_VIRTUA)
-#define DEVTRACE_RING_CAP (1u << 11)
-#else
-#define DEVTRACE_RING_CAP (1u << 20)
-#endif  /* 1M events (~24 MB); covers the whole
+#define DEVTRACE_RING_CAP (1u << 20)  /* 1M events (~24 MB); covers the whole
                                        * boot->wedge window so the divergent
                                        * event is in-window, never evicted. */
 

@@ -143,6 +143,18 @@ button:hover { background-color: #232d3c; }
 .verdict-detail { display: block; color: #8b949e; font-size: 13dp; }
 .change-iso { position: absolute; top: 20dp; right: 22dp; }
 
+/* ---- online match panel (hidden unless the Online client launched us) ---- */
+.net-panel { position: relative; }
+.net-title { display: block; font-size: 22dp; font-weight: bold; color: #ffffff; }
+.net-state { display: block; color: #7ee2a8; font-size: 15dp; margin-bottom: 14dp; }
+.net-msg { display: block; color: #9aa4b2; font-size: 13dp; margin-top: 10dp;
+	border-top: 1dp #1e2733; padding-top: 10dp; }
+.net-actions { position: absolute; top: 20dp; right: 22dp; }
+.net-connect { background-color: #1d4ed8; border: 1dp #2563eb; color: #ffffff; font-weight: bold; }
+.net-connect:hover { background-color: #2563eb; }
+.net-leave { margin-left: 8dp; }
+.net-auto { color: #8b949e; font-size: 13dp; }
+
 /* ---- player / memcard card chrome ---- */
 .card-head { display: flex; flex-direction: row; align-items: center; margin-bottom: 14dp; }
 .card-icon { width: 18dp; height: 18dp; margin-right: 8dp; }
@@ -348,6 +360,27 @@ button:hover { background-color: #232d3c; }
 
 	<!-- ================= DASHBOARD VIEW ================= -->
 	<div data-if="view == 'dashboard'">
+
+		<!-- Online match. Present only when the Online client launched this
+		     process; an ordinary run never sees it. Both games restart together
+		     when the two players are ready, so nothing is carried over and
+		     nothing is downloaded from the other machine. -->
+		<div class="panel net-panel" data-if="net_available">
+			<div class="eyebrow">ONLINE MATCH</div>
+			<div class="net-title">{{net_label}}</div>
+			<div class="net-state">{{net_state}}</div>
+			<div class="meta-row">
+				<div class="meta"><div class="meta-k">OPPONENT</div><div class="meta-v">{{net_opponent}}</div></div>
+				<div class="meta"><div class="meta-k">YOU ARE</div><div class="meta-v">{{net_slot}}</div></div>
+				<div class="meta"><div class="meta-k">CONNECTION</div><div class="meta-v">{{net_link}}</div></div>
+			</div>
+			<div class="net-actions">
+				<button class="net-connect" data-if="net_can_connect" data-event-click="connect_player2">Connect player 2</button>
+				<span class="net-auto" data-if="net_tournament">Bracket match — it starts itself</span>
+				<button class="net-leave" data-if="net_active" data-event-click="leave_match">Leave match</button>
+			</div>
+			<div class="net-msg" data-if="net_message != ''">{{net_message}}</div>
+		</div>
 
 		<div class="panel disc-panel" data-if="pause_mode == false">
 			<div class="disc-art"></div>

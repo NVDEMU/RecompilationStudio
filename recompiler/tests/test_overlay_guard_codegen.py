@@ -69,11 +69,12 @@ def gen_c(recompiler, overlay, tmp):
     if r.returncode != 0:
         raise SystemExit(f"recompiler failed ({'overlay' if overlay else 'static'}):\n"
                          f"{r.stderr or r.stdout}")
-    full = [f for f in os.listdir(out) if f.endswith("_full.c")]
-    if not full:
-        raise SystemExit(f"no _full.c emitted in {out}")
-    with open(os.path.join(out, full[0])) as f:
-        return f.read()
+    units = sorted(f for f in os.listdir(out) if "_cu_" in f and f.endswith(".c"))
+    if not units:
+        units = [f for f in os.listdir(out) if f.endswith("_full.c")]
+    if not units:
+        raise SystemExit(f"no generated compilation units in {out}")
+    return "\n".join(open(os.path.join(out, name)).read() for name in units)
 
 
 def main():

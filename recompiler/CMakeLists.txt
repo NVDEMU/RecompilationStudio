@@ -115,6 +115,7 @@ set(PSXRECOMP_GAME_SOURCES
     src/control_flow.cpp
     src/function_analysis.cpp
     src/code_generator.cpp
+    src/compilation_units.cpp
     src/annotations.cpp
     src/config_loader.cpp
     src/main_psx.cpp
@@ -123,6 +124,7 @@ set(PSXRECOMP_GAME_SOURCES
 add_executable(psxrecomp-game ${PSXRECOMP_GAME_SOURCES})
 target_include_directories(psxrecomp-game PRIVATE
     include
+    src
     lib/rabbitizer/include
     lib/rabbitizer/cplusplus/include
     lib/fmt/include
@@ -181,6 +183,7 @@ target_include_directories(psxrecomp-game PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 add_executable(PSXRecomp ${PSXRECOMP_GAME_SOURCES})
 target_include_directories(PSXRecomp PRIVATE
     include
+    src
     lib/rabbitizer/include
     lib/rabbitizer/cplusplus/include
     lib/fmt/include
@@ -208,6 +211,7 @@ add_executable(psxrecomp-bios
     src/bios_slice_walker.cpp
     src/function_discovery.cpp
     src/full_function_emitter.cpp
+    src/compilation_units.cpp
     src/config_loader.cpp
     src/main_bios.cpp
 )
@@ -287,10 +291,22 @@ target_include_directories(config_loader_controller_test PRIVATE
 )
 target_link_libraries(config_loader_controller_test PRIVATE fmt)
 
+add_executable(compilation_units_test
+    tests/compilation_units_test.cpp
+    src/compilation_units.cpp
+)
+target_include_directories(compilation_units_test PRIVATE
+    include
+    src
+    lib/fmt/include
+)
+target_link_libraries(compilation_units_test PRIVATE fmt)
+
 enable_testing()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_test(NAME config_loader_controller COMMAND config_loader_controller_test)
 add_test(NAME function_analysis_validity COMMAND function_analysis_validity_test)
+add_test(NAME compilation_units COMMAND compilation_units_test)
 add_test(
     NAME dispatch_hash_codegen
     COMMAND ${Python3_EXECUTABLE}

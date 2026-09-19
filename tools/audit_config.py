@@ -57,7 +57,9 @@ class AuditConfig:
 
     # Generated artifacts (derived from rom stem + out_dir)
     out_dir: Path
+    out_stem: str
     full_c: Path
+    generated_c: List[Path]
     dispatch_c: Path
 
     # Audit-specific
@@ -149,7 +151,10 @@ def load(config_path) -> AuditConfig:
             out_stem = rom_name[:-4]
         else:
             out_stem = rom_name
-    full_c = out_dir / f"{out_stem}_full.c"
+    generated_c = sorted(out_dir.glob(f"{out_stem}_cu_*.c"))
+    full_c = generated_c[0] if generated_c else out_dir / f"{out_stem}_full.c"
+    if not generated_c and full_c.is_file():
+        generated_c = [full_c]
     dispatch_c = out_dir / f"{out_stem}_dispatch.c"
 
     # Audit block
@@ -191,7 +196,9 @@ def load(config_path) -> AuditConfig:
         load_address=load_address,
         text_size=text_size,
         out_dir=out_dir,
+        out_stem=out_stem,
         full_c=full_c,
+        generated_c=generated_c,
         dispatch_c=dispatch_c,
         function_starts=function_starts,
         regions=regions,

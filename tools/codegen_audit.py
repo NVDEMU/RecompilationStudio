@@ -78,22 +78,27 @@ def main() -> int:
     json_out = option_value(sys.argv, "--json-out")
 
     print(f"# codegen audit: {cfg.name}")
-    print(f"  full_c     = {cfg.full_c}")
-    print(f"  dispatch_c = {cfg.dispatch_c}")
+    print(f"  generated_c = {len(cfg.generated_c)} compilation unit(s)")
+    print(f"  dispatch_c  = {cfg.dispatch_c}")
     print()
 
-    if not cfg.full_c.exists():
-        print(f"ERROR: full_c not found: {cfg.full_c}", file=sys.stderr)
+    if not cfg.generated_c:
+        print(f"ERROR: no generated compilation units in {cfg.out_dir}", file=sys.stderr)
+        return 2
+    missing = [path for path in cfg.generated_c if not path.is_file()]
+    if missing:
+        print(f"ERROR: generated C not found: {missing[0]}", file=sys.stderr)
         return 2
     if not cfg.dispatch_c.exists():
         print(f"ERROR: dispatch_c not found: {cfg.dispatch_c}", file=sys.stderr)
         return 2
 
-    full_c = cfg.full_c.read_text(encoding="utf-8", errors="replace")
+    full_c = "\n".join(path.read_text(encoding="utf-8", errors="replace")
+                       for path in cfg.generated_c)
     dispatch_c = cfg.dispatch_c.read_text(encoding="utf-8", errors="replace")
     expected_misses = EXPECTED_TAIL_CALL_MISSES.get(cfg.name, set())
 
-    dynamic_path = Path(str(cfg.full_c).replace("_full.c", "_dynamic_targets.json"))
+    dynamic_path = cfg.out_dir / f"{cfg.out_stem}_dynamic_targets.json"
     dynamic_targets_raw: set[int] = set()
     dynamic_manifest_error = ""
     if dynamic_path.is_file():
@@ -236,13 +241,13 @@ def main() -> int:
             print(f"      0x{value:08X}")
 
     # ---- 5. code-range and data-range manifests ----
-    ranges_path = cfg.full_c.with_suffix(".ranges")
+    ranges_path = cfg.out_dir / f"{cfg.out_stem}_full.ranges"
     range_entries_raw, code_ranges_raw = parse_ranges(ranges_path)
     range_entries = {cfg.normalize_addr(value) for value in range_entries_raw}
     missing_range_entries = sorted(definition_entries - range_entries)
     extra_range_entries = sorted(range_entries - definition_entries)
 
-    data_path = Path(str(cfg.full_c).replace("_full.c", "_data_ranges.json"))
+    data_path = cfg.out_dir / f"{cfg.out_stem}_data_ranges.json"
     data_ranges_raw: list[tuple[int, int]] = []
     data_manifest_error = ""
     if data_path.is_file():

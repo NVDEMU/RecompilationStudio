@@ -502,6 +502,12 @@ BiosConfig load_bios_config(const fs::path& config_path_in) {
         out_stem = derive_out_stem(fs::path(rom_field).filename().string());
     }
 
+    fs::path compilation_units_path;
+    if (recomp.contains("compilation_units")) {
+        compilation_units_path = fs::absolute(
+            root / toml::find<std::string>(recomp, "compilation_units"));
+    }
+
     // [[recompiler.bios_vectors]] — optional array of vector dispatch tables
     std::vector<BiosVectorTable> bios_vectors;
     if (recomp.contains("bios_vectors")) {
@@ -553,6 +559,7 @@ BiosConfig load_bios_config(const fs::path& config_path_in) {
         /*out_stem*/     out_stem,
         /*bios_vectors*/ std::move(bios_vectors),
         /*bios_aliases*/ std::move(bios_aliases),
+        /*compilation_units_path*/ compilation_units_path,
         /*runtime*/      parse_runtime_block(cfg, root),
     };
 }
@@ -723,6 +730,12 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         out_stem = toml::find<std::string>(recomp, "out_stem");
     } else {
         out_stem = derive_out_stem(fs::path(exe_field).filename().string());
+    }
+
+    fs::path compilation_units_path;
+    if (recomp.contains("compilation_units")) {
+        compilation_units_path = fs::absolute(
+            root / toml::find<std::string>(recomp, "compilation_units"));
     }
 
     // Optional [widescreen] block — per-game hooks for the widescreen hack.
@@ -1001,6 +1014,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_layer_struct_stride*/ ws_bg2d_layer_struct_stride,
         /*ws_bg2d_init_func*/     ws_bg2d_init_func,
         /*ws_bg2d_packet_cap*/    ws_bg2d_packet_cap,
+        /*compilation_units_path*/ compilation_units_path,
     };
 }
 

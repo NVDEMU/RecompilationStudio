@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # regen_bios.sh — canonical, hygiene-safe regeneration of the BIOS generated C.
 #
-# WHY THIS EXISTS: generated/SCPH1001_*.c is gitignored build output. The
+# WHY THIS EXISTS: generated/SCPH1001_cu_*.c is gitignored build output. The
 # recompiler (psxrecomp-bios) and the runtime are built by SEPARATE CMake trees,
 # so editing the BIOS emitter (full_function_emitter.cpp, strict_translator.cpp,
 # the cycle headers, …) does NOT automatically refresh generated/. If you forget

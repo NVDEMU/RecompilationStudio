@@ -34,6 +34,48 @@ import tempfile
 import threading
 
 
+def collect_generated_c_units(out_dir):
+    """Return generated function-body C files, preferring compilation units."""
+    names = sorted(fn for fn in os.listdir(out_dir)
+                   if re.search(r'_cu_\d{3}_.*\.c$', fn))
+    if names:
+        return [os.path.join(out_dir, fn) for fn in names]
+    names = [fn for fn in os.listdir(out_dir) if fn.endswith('_full.c')]
+    return [os.path.join(out_dir, fn) for fn in names]
+
+
+def read_generated_c(out_dir):
+    """Concatenate generated C bodies and inline local prelude/decls headers.
+
+    Overlay DLL/static compile copies the patched C out of the recompiler
+    output directory, so quoted includes of <stem>_cu_prelude.h must be
+    expanded here.
+    """
+    paths = collect_generated_c_units(out_dir)
+    if not paths:
+        return None
+    inlined = set()
+
+    def inline_local(match):
+        name = match.group(1)
+        path = os.path.join(out_dir, name)
+        if name in inlined or not os.path.isfile(path):
+            return match.group(0)
+        inlined.add(name)
+        body = open(path, encoding='utf-8', errors='replace').read()
+        body = re.sub(r'^#pragma once\s*\n', '', body, flags=re.M)
+        return re.sub(r'^#include\s+"([^"]+)"\s*$', inline_local, body, flags=re.M)
+
+    chunks = []
+    for index, path in enumerate(paths):
+        text = open(path, encoding='utf-8', errors='replace').read()
+        text = re.sub(r'^#include\s+"([^"]+)"\s*$', inline_local, text, flags=re.M)
+        if index > 0:
+            text = re.sub(r'^#include\s+[<"].*[>"]\s*\n', '', text, flags=re.M)
+        chunks.append(text)
+    return '\n'.join(chunks)
+
+
 class _ThreadLocalStdout:
     """stdout proxy for the parallel region workers: a thread that registered
     a buffer gets every print() captured there (so one region's log emits as
@@ -1424,16 +1466,14 @@ def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
                            env=sub_env)
         if r.returncode != 0:
             return None
-        full_c = ranges_src = None
+        ranges_src = None
         for fn in os.listdir(out_dir_tmp):
-            if fn.endswith('_full.c'):
-                full_c = os.path.join(out_dir_tmp, fn)
-            elif fn.endswith('_full.ranges'):
+            if fn.endswith('_full.ranges'):
                 ranges_src = os.path.join(out_dir_tmp, fn)
-        if not full_c or not ranges_src:
+        src = read_generated_c(out_dir_tmp)
+        if not src or not ranges_src:
             return None
-        with open(full_c) as f:
-            src = patch_generated_c(f.read(), load_addr, size)
+        src = patch_generated_c(src, load_addr, size)
         c_audit = audit_generated_c(src, load_addr, size,
                                     binascii.crc32(data) & 0xFFFFFFFF, {})
         if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
@@ -1876,19 +1916,10 @@ def main():
                 print(f'  RECOMPILER ERROR:\n{r.stderr or r.stdout}')
                 return
 
-            # Find the generated _full.c
-            stem = os.path.basename(psx_path)
-            full_c = os.path.join(out_dir_tmp, stem + '_full.c')
-            if not os.path.exists(full_c):
-                # psxrecomp-game uses filename() not stem()
-                candidates = [f for f in os.listdir(out_dir_tmp) if f.endswith('_full.c')]
-                if not candidates:
-                    print(f'  ERROR: no _full.c in {out_dir_tmp}')
-                    return
-                full_c = os.path.join(out_dir_tmp, candidates[0])
-
-            with open(full_c) as f:
-                src = f.read()
+            src = read_generated_c(out_dir_tmp)
+            if not src:
+                print(f'  ERROR: no generated compilation units in {out_dir_tmp}')
+                return
 
             # Post-process
             if args.static:

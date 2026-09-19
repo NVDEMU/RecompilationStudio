@@ -17,6 +17,9 @@
 extern "C" {
 #include "memcard.h"
 #include "psx_keybinds.h"
+#if defined(PSX_NETPLAY)
+#include "psx_netplay.h"   /* the ONLINE panel, and "connect player 2" */
+#endif
 }
 
 #include <RmlUi/Core.h>
@@ -202,9 +205,82 @@ struct LauncherModel {
     // robust path and the markup is fully launcher-controlled.)
     Rml::String mc1_grid, mc2_grid;
 
+    // Online match (psx_netplay.h). net_available is false in every ordinary
+    // run — the process was started by a player, not by the Online client — and
+    // the whole panel is hidden. In a match this is where player 2 connects,
+    // which is why it lives in the pause menu rather than in a screen of its
+    // own: the game is already running, and the panel is one Esc away.
+    bool net_available   = false;
+    bool net_active      = false;   // a session channel is open
+    bool net_can_connect = false;   // the Connect action would do something
+    bool net_tournament  = false;   // a bracket match: it connects itself
+    Rml::String net_state;     // "Waiting for your opponent" — in a player's words
+    Rml::String net_label;     // "Ada vs Grace", from the organizer
+    Rml::String net_opponent;
+    Rml::String net_slot;      // "Player 1" | "Player 2" — the guest port held
+    Rml::String net_link;      // "Direct · 23 ms · 3 frames of delay"
+    Rml::String net_message;   // the last thing worth telling the player
+
     bool launch_requested = false;
     bool quit_requested   = false;
 };
+
+#if defined(PSX_NETPLAY)
+// Refresh the ONLINE panel from the session, dirtying only what actually moved.
+// The runtime's own phase names (see psx_netplay.h) are for logs; nobody sitting
+// in front of a paused game wants to read "ResetPending".
+void refresh_netplay(LauncherModel& m, Rml::DataModelHandle handle) {
+    PsxNetplayStatus s;
+    psx_netplay_status(&s);
+
+    auto set_b = [&](bool& dst, bool src, const char* name) {
+        if (dst != src) { dst = src; handle.DirtyVariable(name); }
+    };
+    auto set_s = [&](Rml::String& dst, const std::string& src, const char* name) {
+        if (dst != Rml::String(src.c_str())) {
+            dst = Rml::String(src.c_str());
+            handle.DirtyVariable(name);
+        }
+    };
+
+    set_b(m.net_available,   s.available != 0,   "net_available");
+    set_b(m.net_active,      s.active != 0,      "net_active");
+    set_b(m.net_can_connect, s.can_connect != 0, "net_can_connect");
+    set_b(m.net_tournament,  s.tournament != 0,  "net_tournament");
+    set_s(m.net_label,    s.label[0] ? s.label : "Online match", "net_label");
+    set_s(m.net_opponent, s.opponent[0] ? s.opponent : "—",      "net_opponent");
+    set_s(m.net_slot,     s.local_slot == 2 ? "Player 2" : "Player 1", "net_slot");
+    set_s(m.net_message,  s.message, "net_message");
+
+    const std::string phase = s.state;
+    std::string words;
+    if (!s.reset_ready)          words = "Loading the game";
+    else if (phase == "offline") words = "Not in a match";
+    else if (phase == "connecting") words = "Reaching your opponent";
+    else if (phase == "waiting")
+        words = s.connected ? "Waiting for your opponent" : "Ready when you are";
+    else if (phase == "countdown")  words = "Starting";
+    else if (phase == "restarting") words = "Restarting both games";
+    else if (phase == "playing")    words = "Playing";
+    else if (phase == "finished")   words = "Match over";
+    else                            words = "The match could not continue";
+    if (phase == "countdown" && s.starts_in_ms > 0)
+        words += " in " + std::to_string((s.starts_in_ms + 999) / 1000) + "s";
+    set_s(m.net_state, words, "net_state");
+
+    std::string link;
+    if (s.running) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%s · %d ms · %d frame%s of delay",
+                      s.direct ? "Direct" : "Relayed", s.round_trip_ms,
+                      s.input_delay, s.input_delay == 1 ? "" : "s");
+        link = buf;
+    } else {
+        link = s.peer_present ? "Your opponent is here" : "—";
+    }
+    set_s(m.net_link, link, "net_link");
+}
+#endif
 
 // Format a unix timestamp as e.g. "Jun 12, 2026". Empty for 0/unknown.
 std::string fmt_mtime(long long secs) {
@@ -937,6 +1013,16 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("mc2_foot",       &m.mc2_foot);
     c.Bind("mc1_grid",       &m.mc1_grid);
     c.Bind("mc2_grid",       &m.mc2_grid);
+    c.Bind("net_available",  &m.net_available);
+    c.Bind("net_active",     &m.net_active);
+    c.Bind("net_can_connect",&m.net_can_connect);
+    c.Bind("net_tournament", &m.net_tournament);
+    c.Bind("net_state",      &m.net_state);
+    c.Bind("net_label",      &m.net_label);
+    c.Bind("net_opponent",   &m.net_opponent);
+    c.Bind("net_slot",       &m.net_slot);
+    c.Bind("net_link",       &m.net_link);
+    c.Bind("net_message",    &m.net_message);
 
     Rml::DataModelHandle handle = c.GetModelHandle();
 
@@ -1295,6 +1381,24 @@ Result run(SDL_Window* window, void* gl_context,
         [new_mc](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable { new_mc(0); });
     c.BindEventCallback("new_mc2",
         [new_mc](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable { new_mc(1); });
+#if defined(PSX_NETPLAY)
+    /* "Connect player 2" — this machine is loaded and ready to restart. The
+     * opposite number on the other machine does the same, and the organizer
+     * then picks the instant both games restart from. A bracket match has
+     * already done this by itself; the button is only offered for a casual set,
+     * where nobody has agreed to start yet. Resume afterwards: the match cannot
+     * run while the guest is held here. */
+    c.BindEventCallback("connect_player2",
+        [&m](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+            psx_netplay_connect();
+            m.launch_requested = true;
+        });
+    c.BindEventCallback("leave_match",
+        [&m](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+            psx_netplay_leave(PSX_NETPLAY_LEFT_QUIT);
+            m.launch_requested = true;
+        });
+#endif
     c.BindEventCallback("launch",
         [&m](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { m.launch_requested = true; });
     c.BindEventCallback("quit",
@@ -1379,6 +1483,10 @@ Result run(SDL_Window* window, void* gl_context,
      * while hidden collapses percentage widths permanently. */
     if (m.view == "controls") rebuild_pending = true;
 
+#if defined(PSX_NETPLAY)
+    refresh_netplay(m, handle);   /* so the panel is right on its first frame */
+#endif
+
     // ---- Main loop ----
     bool running = true;
     while (running) {
@@ -1454,6 +1562,14 @@ Result run(SDL_Window* window, void* gl_context,
                 break;
             }
         }
+
+#if defined(PSX_NETPLAY)
+        /* The opponent is still there while this menu is open, and the path to
+         * them is still being probed, so the transport has to keep running even
+         * though the guest does not. */
+        psx_netplay_update();
+        refresh_netplay(m, handle);
+#endif
 
         if (m.launch_requested) { result = Result::Launch; running = false; }
         if (m.quit_requested)   { result = Result::Quit;   running = false; }

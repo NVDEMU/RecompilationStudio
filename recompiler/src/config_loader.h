@@ -368,6 +368,7 @@ struct BiosConfig {
     std::string           out_stem;      // derived if not explicit
     std::vector<BiosVectorTable> bios_vectors; // optional vector dispatch tables
     std::vector<BiosAlias>       bios_aliases; // optional fixed-target trampolines
+    std::filesystem::path compilation_units_path; // optional Ghidra CU map
 
     // [runtime] block (optional)
     RuntimeConfig         runtime;
@@ -625,6 +626,10 @@ struct GameConfig {
     //   reveal pixels once before the new stage background is submitted.
     uint32_t ws_bg2d_init_func    = 0;
     uint32_t ws_bg2d_packet_cap       = 1000;
+
+    // Optional Ghidra compilation-unit map consumed by the modular C emitter.
+    // Empty => synthesize address-range units.
+    std::filesystem::path compilation_units_path;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

@@ -53,8 +53,6 @@ private slots:
   void chooseOutputDirectory();
   void chooseCertificate();
   void chooseGhidraHome();
-  void choosePowerEngineRoot();
-  void chooseLlvmRoot();
   void chooseBiosInitialSplash();
   void chooseBiosHandoffImage();
   void updateBiosPatchControls();
@@ -86,8 +84,6 @@ private:
                         const QString& placeholder,
                         const char* slot);
   QString detectGhidraHome() const;
-  QString detectPowerEngineRoot() const;
-  QString detectLlvmRoot() const;
   void loadSettings();
   void saveSettings() const;
   /* Refills the system combo with the systems the selected platform can run,
@@ -142,8 +138,6 @@ private:
   QCheckBox* signingEnabled_{ nullptr };
   QLabel* signingNote_{ nullptr };
   QLineEdit* ghidraEdit_{ nullptr };
-  QLineEdit* powerEngineEdit_{ nullptr };
-  QLineEdit* llvmEdit_{ nullptr };
   QCheckBox* biosPatchEnabled_{ nullptr };
   QLineEdit* biosInitialSplashEdit_{ nullptr };
   QLineEdit* biosHandoffImageEdit_{ nullptr };
@@ -168,10 +162,7 @@ private:
   QScrollArea* formsScroll_{ nullptr };
   QGridLayout* formsLayout_{ nullptr };
   oclero::qlementine::ThemeManager* themeManager_{ nullptr };
-  /* One form's worth of state per system. Switching the system combo swaps the
-   * whole set, so a PlayStation disc never survives into a Vita export and a
-   * Horizon title never lands on the GBA form. This was two parallel sets of
-   * scalars for two systems; four systems is where that stops scaling. */
+  /* One form's worth of state for the PlayStation system selector. */
   struct SystemFormState {
     QString inputPath;
     QString biosPath;

@@ -86,12 +86,18 @@ bios_thunks = "seeds/tomba_bios_thunks.txt"                # game-only
 out_dir     = "generated"                                  # both
 strict      = true                                         # both — currently always true
 out_stem    = "SCPH1001"                                   # optional; overrides the auto-derived stem
+compilation_units = "seeds/ghidra_compilation_units.json"  # optional Ghidra CU map (DWARF / PSY-Q $Id object files / Program Tree)
 ```
 
-Output filenames: `<out_dir>/<out_stem>_full.c` and
-`<out_dir>/<out_stem>_dispatch.c`. If `out_stem` is omitted, it's derived
-from the `rom`/`exe` file basename with the trailing `.BIN` or `.EXE`
-stripped (`Path.stem` is NOT used because it mishandles `SCUS_942.36`).
+Output filenames: `<out_dir>/<out_stem>_cu_NNN_*.c` (function bodies, one
+host compilation unit each), `<out_dir>/<out_stem>_decls.h`,
+`<out_dir>/<out_stem>_cu_prelude.h`, `<out_dir>/<out_stem>_units.json`, and
+`<out_dir>/<out_stem>_dispatch.c`. If `compilation_units` is set, functions
+are grouped by the Ghidra source-file / PSY-Q object-file / Program Tree / namespace map;
+otherwise the emitter packs address-contiguous functions. If `out_stem` is
+omitted, it's derived from the `rom`/`exe` file basename with the trailing
+`.BIN` or `.EXE` stripped (`Path.stem` is NOT used because it mishandles
+`SCUS_942.36`).
 
 ## Runtime block
 

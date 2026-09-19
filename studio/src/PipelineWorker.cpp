@@ -3,8 +3,6 @@
 #include "BiosBrandingPatcher.h"
 #include "CueSheet.h"
 #include "DiscInspector.h"
-#include "GbaSupport.h"
-#include "GuestAppSupport.h"
 #include "PipelineSupport.h"
 
 #include <QCoreApplication>
@@ -28,7 +26,6 @@
 #include <QThread>
 #include <QUuid>
 #include <QVersionNumber>
-#include <QtEndian>
 
 #include <algorithm>
 #include <memory>
@@ -59,44 +56,6 @@ constexpr auto kLinuxControllerDbArchiveSha256 =
   "e260456d9c7bdff5f2f8a0db0f772316b44d3e4f7833f72ff8328e95b30eb0ec";
 constexpr auto kLinuxControllerDbSha256 =
   "dd4dd9dcb458aa4fbfd9b37ccdd4884b1e2e258edf8a16c3c4df3e77ac5174a0";
-
-bool isPowerEngineRoot(const QString& root) {
-  if (root.trimmed().isEmpty()) return false;
-  const QDir directory(root);
-  for (const auto& relative : {
-         QStringLiteral("External/Virtua/CMake/GoTooling.cmake"),
-         QStringLiteral("External/Virtua/binary/virtua.go"),
-         QStringLiteral("External/Virtua/Dash/CMakeLists.txt"),
-         QStringLiteral("External/Virtua/Dash/llvm_libc_stubs.cpp"),
-         QStringLiteral("OS/MVII/Kernel/Shared/posix-shim/include/pthread.h"),
-         QStringLiteral("OS/MVII/Examples/Pong/linker_armv7.ld") }) {
-    if (!QFileInfo(directory.filePath(relative)).isFile()) return false;
-  }
-  return true;
-}
-
-bool isVirtuaLlvmRoot(const QString& root) {
-  if (root.trimmed().isEmpty()) return false;
-  const QDir bin(QDir(root).filePath(QStringLiteral("bin")));
-  const bool compiler = QFileInfo(bin.filePath(QStringLiteral("compiler"))).isExecutable() ||
-                        QFileInfo(bin.filePath(QStringLiteral("clang"))).isExecutable();
-  const bool compilerxx = QFileInfo(bin.filePath(QStringLiteral("compiler++"))).isExecutable() ||
-                          QFileInfo(bin.filePath(QStringLiteral("clang++"))).isExecutable();
-  return compiler && compilerxx &&
-         QFileInfo(bin.filePath(QStringLiteral("llvm-ar"))).isExecutable() &&
-         QFileInfo(bin.filePath(QStringLiteral("llvm-ranlib"))).isExecutable() &&
-         QFileInfo(bin.filePath(QStringLiteral("llvm-objcopy"))).isExecutable() &&
-         QFileInfo(bin.filePath(QStringLiteral("ld.lld"))).isExecutable();
-}
-
-QString virtuaCompilerPath(const QString& root) {
-  const QDir bin(QDir(root).filePath(QStringLiteral("bin")));
-  for (const auto& name : { QStringLiteral("compiler"), QStringLiteral("clang") }) {
-    const QString path = bin.filePath(name);
-    if (QFileInfo(path).isExecutable()) return path;
-  }
-  return {};
-}
 
 QString escapedComment(QString text) {
   text.replace('\n', ' ');
@@ -135,91 +94,6 @@ QSet<quint32> readDynamicTargets(const QString& path, QString& error) {
     targets.insert(target);
   }
   return targets;
-}
-
-/* Every guest address gbarecomp translated to a native function, read out of
- * the dispatch table it emits. That table is the runtime's own lookup, so it
- * is the honest measure of static coverage: an address absent from it is an
- * address the runtime would have to interpret or self-heal. Entries look like
- *   { 0x080000C0u, 0u, gf_start_vector },
- * with the middle column carrying the THUMB flag. */
-// `lengthSymbol` is kDispatchTableLen for a cartridge table and
-// kBiosDispatchTableLen for a BIOS table. Naming the expected symbol rather than
-// accepting either keeps a swapped output path from reading as a valid table.
-//
-// The table is keyed by (address, mode), not by address: interworking and
-// mid-function resume points legitimately put one address in the table twice,
-// once ARM and once THUMB. `modesByAddress` therefore carries a bitmask —
-// kGbaModeArm and/or kGbaModeThumb — and the declared length is compared against
-// the row count, not against the number of distinct addresses.
-//
-// Returns the number of parsed rows, or -1 when the table cannot be trusted.
-constexpr quint8 kGbaModeArm = 1u;
-constexpr quint8 kGbaModeThumb = 2u;
-
-QString describeGbaModes(quint8 modes) {
-  if ((modes & kGbaModeArm) && (modes & kGbaModeThumb))
-    return QStringLiteral("arm+thumb");
-  if (modes & kGbaModeThumb) return QStringLiteral("thumb");
-  if (modes & kGbaModeArm) return QStringLiteral("arm");
-  return QStringLiteral("none");
-}
-
-int readGbaDispatchEntries(const QString& path,
-                           const QString& lengthSymbol,
-                           QHash<quint32, quint8>& modesByAddress,
-                           QString& error) {
-  QFile file(path);
-  if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-    error = QStringLiteral("Could not read the gbarecomp dispatch table %1: %2")
-              .arg(path, file.errorString());
-    return -1;
-  }
-  const QString text = QString::fromUtf8(file.readAll());
-  static const QRegularExpression entryPattern(
-    QStringLiteral(R"(\{\s*0x([0-9A-Fa-f]{1,8})u?\s*,\s*([01])u?\s*,)"));
-  int rows = 0;
-  auto matches = entryPattern.globalMatch(text);
-  while (matches.hasNext()) {
-    const auto match = matches.next();
-    bool ok = false;
-    const quint32 address = match.captured(1).toUInt(&ok, 16);
-    if (!ok) {
-      error = QStringLiteral("Invalid dispatch entry address in %1.").arg(path);
-      return -1;
-    }
-    modesByAddress[address] |= match.captured(2) == QStringLiteral("1")
-      ? kGbaModeThumb : kGbaModeArm;
-    ++rows;
-  }
-  const QRegularExpression lengthPattern(
-    QStringLiteral(R"(\b%1\s*=\s*(\d+))").arg(QRegularExpression::escape(lengthSymbol)));
-  const auto lengthMatch = lengthPattern.match(text);
-  if (!lengthMatch.hasMatch()) {
-    error = QStringLiteral("%1 does not declare %2.").arg(path, lengthSymbol);
-    return -1;
-  }
-  const int declared = lengthMatch.captured(1).toInt();
-  if (declared != rows) {
-    error = QStringLiteral(
-      "The gbarecomp dispatch table declares %1 entries but %2 parsed; the "
-      "coverage oracle cannot be trusted.").arg(declared).arg(rows);
-    return -1;
-  }
-  return rows;
-}
-
-QVector<quint32> readGbaSourceList(const QJsonObject& function, const QString& key) {
-  QVector<quint32> addresses;
-  for (const auto& value : function.value(key).toArray()) {
-    bool ok = false;
-    const quint32 address = value.toString().toUInt(&ok, 16);
-    // Ghidra records synthetic sources such as "Entry Point" for references
-    // with no originating instruction. Those carry no location evidence, so
-    // they are dropped rather than parsed into a bogus address.
-    if (ok) addresses.append(address);
-  }
-  return addresses;
 }
 
 QList<QPair<quint32, quint32>> readDataRanges(const QString& path, QString& error) {
@@ -317,7 +191,8 @@ QString makeGameToml(const PipelineRequest& request,
                      const QString& exePath,
                      const QString& discPath,
                      const QString& seedsPath,
-                     const QString& outDir) {
+                     const QString& outDir,
+                     const QString& compilationUnitsPath = {}) {
   const quint32 romEnd = 0x800u + game.textSize;
   QString text;
   text += QStringLiteral("[game]\n");
@@ -332,7 +207,11 @@ QString makeGameToml(const PipelineRequest& request,
   text += QStringLiteral("[recompiler]\n");
   text += QStringLiteral("seeds = %1\n").arg(tomlQuoted(seedsPath));
   text += QStringLiteral("out_dir = %1\n").arg(tomlQuoted(outDir));
-  text += QStringLiteral("strict = true\n\n");
+  text += QStringLiteral("strict = true\n");
+  if (!compilationUnitsPath.isEmpty()) {
+    text += QStringLiteral("compilation_units = %1\n").arg(tomlQuoted(compilationUnitsPath));
+  }
+  text += QStringLiteral("\n");
   text += QStringLiteral("[runtime]\n");
   text += QStringLiteral("window_title = %1\n").arg(tomlQuoted(request.windowTitle));
   text += QStringLiteral("disc_speed = \"1x\"\n");
@@ -429,62 +308,11 @@ QString makeLinuxToolchain(const QString& gcc,
   return cmake;
 }
 
-QString makeVirtuaProjectCMake(const PipelineRequest& request,
-                                const GameDescription& game,
-                                const QString& bundleName,
-                                quint32 expectedBiosCrc) {
-  const QString appSupportName = QStringLiteral("PSXRecomp/%1").arg(
-    game.serial.isEmpty() ? sanitizedFileStem(request.windowTitle) : game.serial);
-  QString cmake;
-  cmake += QStringLiteral("cmake_minimum_required(VERSION 3.20)\n");
-  cmake += QStringLiteral("project(GeneratedPSXVirtuaApp C CXX ASM)\n");
-  cmake += QStringLiteral("set(CMAKE_C_STANDARD 11)\nset(CMAKE_CXX_STANDARD 17)\n");
-  cmake += QStringLiteral("set(PSXRECOMP_ROOT \"${CMAKE_CURRENT_SOURCE_DIR}/framework\" CACHE PATH \"\" FORCE)\n");
-  cmake += QStringLiteral("set(PSXRECOMP_SKIP_BIOS_STALE_CHECK ON CACHE BOOL \"\" FORCE)\n");
-  cmake += QStringLiteral("set(PSX_VIRTUA ON CACHE BOOL \"\" FORCE)\n");
-  cmake += QStringLiteral("set(PSX_LAUNCHER OFF CACHE BOOL \"\" FORCE)\n");
-  cmake += QStringLiteral("set(PSX_SETTINGS_MENU OFF CACHE BOOL \"\" FORCE)\n");
-  cmake += QStringLiteral("set(PSX_DEBUG_TOOLS OFF CACHE BOOL \"\" FORCE)\n");
-  cmake += QStringLiteral("include(${PSXRECOMP_ROOT}/runtime/runtime.cmake)\n");
-  cmake += QStringLiteral("psxrecomp_add_runtime_target(psx-runtime\n");
-  cmake += QStringLiteral("  BIOS_GENERATED_FULL_C \"${CMAKE_CURRENT_SOURCE_DIR}/generated/bios/SCPH1001_full.c\"\n");
-  cmake += QStringLiteral("  BIOS_GENERATED_DISPATCH_C \"${CMAKE_CURRENT_SOURCE_DIR}/generated/bios/SCPH1001_dispatch.c\"\n");
-  cmake += QStringLiteral("  GAME_GENERATED_FULL_C \"${CMAKE_CURRENT_SOURCE_DIR}/generated/%1_full.c\"\n").arg(game.bootFileName);
-  cmake += QStringLiteral("  GAME_GENERATED_DISPATCH_C \"${CMAKE_CURRENT_SOURCE_DIR}/generated/%1_dispatch.c\"\n").arg(game.bootFileName);
-  cmake += QStringLiteral("  WINDOW_TITLE %1\n").arg(cmakeQuoted(request.windowTitle));
-  cmake += QStringLiteral("  EXE_NAME %1\n").arg(cmakeQuoted(bundleName));
-  cmake += QStringLiteral("  DEFAULT_BIOS_PATH \"bios/SCPH1001.BIN\"\n");
-  cmake += QStringLiteral("  DEFAULT_GAME_CONFIG_PATH \"game.toml\"\n");
-  cmake += QStringLiteral("  APP_SUPPORT_DIR_NAME %1)\n").arg(cmakeQuoted(appSupportName));
-  cmake += QStringLiteral("target_compile_definitions(psx-runtime PRIVATE PSX_EXPECTED_BIOS_CRC32=0x%1u)\n")
-             .arg(expectedBiosCrc, 8, 16, QLatin1Char('0'));
-  cmake += QStringLiteral("include(${POWERENGINE_ROOT}/External/Virtua/CMake/GoTooling.cmake)\n");
-  cmake += QStringLiteral("virtua_prepare_go_tool(PSX_VIRTUA_TOOL ${POWERENGINE_ROOT}/External/Virtua ${POWERENGINE_ROOT}/External/Virtua/binary virtua)\n");
-  cmake += QStringLiteral("add_custom_target(psx-virtua-tool DEPENDS \"${PSX_VIRTUA_TOOL}\")\n");
-  cmake += QStringLiteral("add_dependencies(psx-runtime psx-virtua-tool)\n");
-  cmake += QStringLiteral("set(_PSX_PACKAGE_RESOURCES \"${CMAKE_CURRENT_SOURCE_DIR}/package-resources\")\n");
-  cmake += QStringLiteral("set(_PSX_GAME_MANIFEST \"${CMAKE_CURRENT_SOURCE_DIR}/game.manifest.json\")\n");
-  cmake += QStringLiteral("set(_PSX_STAGE \"${CMAKE_BINARY_DIR}/steganos-package/psx-runtime/$<CONFIG>\")\n");
-  cmake += QStringLiteral("set(_PSX_VIRTUA \"${CMAKE_CURRENT_BINARY_DIR}/%1.virtua\")\n").arg(bundleName);
-  cmake += QStringLiteral("add_custom_command(TARGET psx-runtime POST_BUILD\n");
-  cmake += QStringLiteral("  COMMAND \"${PSX_VIRTUA_TOOL}\" -kind exec -app-mode gui -scheduler cooperative \"$<TARGET_FILE:psx-runtime>\" \"${_PSX_VIRTUA}\"\n");
-  cmake += QStringLiteral("  COMMAND ${CMAKE_COMMAND} -E rm -rf \"${_PSX_STAGE}\"\n");
-  cmake += QStringLiteral("  COMMAND ${CMAKE_COMMAND} -E make_directory \"${_PSX_STAGE}\"\n");
-  cmake += QStringLiteral("  COMMAND ${CMAKE_COMMAND} -E copy_if_different \"${_PSX_VIRTUA}\" \"${_PSX_STAGE}/%1.virtua\"\n").arg(bundleName);
-  cmake += QStringLiteral("  COMMAND ${CMAKE_COMMAND} -E copy_if_different \"${CMAKE_CURRENT_SOURCE_DIR}/AppIcon.png\" \"${_PSX_STAGE}/AppIcon.png\"\n");
-  cmake += QStringLiteral("  COMMAND ${CMAKE_COMMAND} -E copy_directory \"${_PSX_PACKAGE_RESOURCES}\" \"${_PSX_STAGE}\"\n");
-  cmake += QStringLiteral("  COMMAND ${CMAKE_COMMAND} -E copy_if_different \"${_PSX_GAME_MANIFEST}\" \"${_PSX_STAGE}/game.manifest.json\"\n");
-  cmake += QStringLiteral("  VERBATIM)\n");
-  return cmake;
-}
-
 QString makeProjectCMake(const PipelineRequest& request,
                          const GameDescription& game,
                          const QString& bundleName,
                          const QString& bundleId,
                          quint32 expectedBiosCrc) {
-  if (request.targetPlatform == TargetPlatform::VirtuaArm)
-    return makeVirtuaProjectCMake(request, game, bundleName, expectedBiosCrc);
   const QString appSupportName = QStringLiteral("PSXRecomp/%1").arg(game.serial.isEmpty()
     ? sanitizedFileStem(request.windowTitle)
     : game.serial);
@@ -587,11 +415,16 @@ QString makeProjectCMake(const PipelineRequest& request,
   cmake += QStringLiteral("set(PSX_DEBUG_TOOLS OFF CACHE BOOL \"\" FORCE)\n");
   cmake += macosGipCmakeOption(macosTarget && request.macosGipGamepad);
   cmake += QStringLiteral("include(${PSXRECOMP_ROOT}/runtime/runtime.cmake)\n");
+  cmake += QStringLiteral("file(GLOB _PSX_BIOS_UNITS CONFIGURE_DEPENDS \"${CMAKE_CURRENT_SOURCE_DIR}/generated/bios/SCPH1001_cu_*.c\")\n");
+  cmake += QStringLiteral("file(GLOB _PSX_GAME_UNITS CONFIGURE_DEPENDS \"${CMAKE_CURRENT_SOURCE_DIR}/generated/%1_cu_*.c\")\n").arg(gameStem);
+  cmake += QStringLiteral("list(SORT _PSX_BIOS_UNITS)\nlist(SORT _PSX_GAME_UNITS)\n");
+  cmake += QStringLiteral("if(NOT _PSX_BIOS_UNITS)\n  message(FATAL_ERROR \"BIOS compilation units missing under generated/bios\")\nendif()\n");
+  cmake += QStringLiteral("if(NOT _PSX_GAME_UNITS)\n  message(FATAL_ERROR \"game compilation units missing under generated\")\nendif()\n");
   cmake += QStringLiteral("psxrecomp_add_runtime_target(psx-runtime\n");
   if (macosTarget) cmake += QStringLiteral("  MACOSX_BUNDLE\n");
-  cmake += QStringLiteral("  BIOS_GENERATED_FULL_C \"${CMAKE_CURRENT_SOURCE_DIR}/generated/bios/SCPH1001_full.c\"\n");
+  cmake += QStringLiteral("  BIOS_GENERATED_UNITS ${_PSX_BIOS_UNITS}\n");
   cmake += QStringLiteral("  BIOS_GENERATED_DISPATCH_C \"${CMAKE_CURRENT_SOURCE_DIR}/generated/bios/SCPH1001_dispatch.c\"\n");
-  cmake += QStringLiteral("  GAME_GENERATED_FULL_C \"${CMAKE_CURRENT_SOURCE_DIR}/generated/%1_full.c\"\n").arg(gameStem);
+  cmake += QStringLiteral("  GAME_GENERATED_UNITS ${_PSX_GAME_UNITS}\n");
   cmake += QStringLiteral("  GAME_GENERATED_DISPATCH_C \"${CMAKE_CURRENT_SOURCE_DIR}/generated/%1_dispatch.c\"\n").arg(gameStem);
   cmake += QStringLiteral("  WINDOW_TITLE %1\n").arg(cmakeQuoted(request.windowTitle));
   cmake += QStringLiteral("  EXE_NAME %1\n").arg(cmakeQuoted(bundleName));
@@ -877,7 +710,6 @@ bool replicateFrameworkSources(const QString& frameworkRoot,
     { QStringLiteral("lib/RmlUi"), QStringLiteral("lib/RmlUi") },
     { QStringLiteral("lib/freetype"), QStringLiteral("lib/freetype") },
     { QStringLiteral("lib/recomp_gamepad"), QStringLiteral("lib/recomp_gamepad") },
-    { QStringLiteral("extra/virtua"), QStringLiteral("extra/virtua") },
   };
   for (const auto& directory : directories) {
     const QString source = QDir(frameworkRoot).filePath(directory.first);
@@ -1045,18 +877,9 @@ bool PipelineWorker::runCommand(const QString& program,
 
 void PipelineWorker::run(PipelineRequest request) {
   cancelRequested_.store(false, std::memory_order_relaxed);
-  if (request.system == SystemKind::GameBoyAdvance) {
-    runGba(request);
-    return;
-  }
-  if (systemRunsGuestNatively(request.system)) {
-    runGuestApp(request);
-    return;
-  }
   const bool windowsTarget = request.targetPlatform == TargetPlatform::Windows;
   const bool linuxTarget = request.targetPlatform == TargetPlatform::Linux;
   const bool macosTarget = request.targetPlatform == TargetPlatform::MacOS;
-  const bool virtuaTarget = request.targetPlatform == TargetPlatform::VirtuaArm;
   const bool sourceExport = request.exportMode == ExportMode::Source;
   const bool remoteCiBuild = request.exportMode == ExportMode::Build &&
                              request.buildBackend == BuildBackend::RemoteCi;
@@ -1067,7 +890,7 @@ void PipelineWorker::run(PipelineRequest request) {
     hostTargetPlatform() == TargetPlatform::Linux;
   const bool crossWindowsTarget = localBuild && windowsTarget && !nativeWindowsTarget;
   const bool crossLinuxTarget = localBuild && linuxTarget && !nativeLinuxTarget;
-  const bool directoryPackageTarget = windowsTarget || linuxTarget || virtuaTarget;
+  const bool directoryPackageTarget = windowsTarget || linuxTarget;
   const bool hasCertificate = !request.certificatePath.trimmed().isEmpty();
   const bool hasCertificatePassword = !request.certificatePassword.isEmpty();
   const bool signingRequested = localBuild && macosTarget &&
@@ -1169,14 +992,6 @@ void PipelineWorker::run(PipelineRequest request) {
     fail(QStringLiteral("The PSXRecomp framework root is invalid."), {});
     return;
   }
-  if (virtuaTarget && !isPowerEngineRoot(request.powerEngineRoot)) {
-    fail(QStringLiteral("The selected PowerEngine root does not contain the canonical Virtua/MVII sources."), {});
-    return;
-  }
-  if (virtuaTarget && !isVirtuaLlvmRoot(request.llvmRoot)) {
-    fail(QStringLiteral("The selected LLVM root is not a complete PowerEngine compiler bundle."), {});
-    return;
-  }
   const QString analyzeHeadless = ghidraAnalyzeHeadlessPath(request.ghidraHome);
   if (analyzeHeadless.isEmpty()) {
     fail(QStringLiteral("The selected Ghidra installation does not provide analyzeHeadless."), {});
@@ -1195,8 +1010,6 @@ void PipelineWorker::run(PipelineRequest request) {
     ? QString() : QDir(javaHome).filePath(QStringLiteral("bin/java"));
 #endif
   const QString git = findExecutable(QStringLiteral("git"));
-  const QString go = localBuild && virtuaTarget
-    ? findExecutable(QStringLiteral("go")) : QString();
   const QString pkgConfig = localBuild && macosTarget
     ? findExecutable(QStringLiteral("pkg-config")) : QString();
   const QString nm = localBuild && macosTarget ? QStringLiteral("/usr/bin/nm") : QString();
@@ -1282,9 +1095,6 @@ void PipelineWorker::run(PipelineRequest request) {
     requiredTools.append({ QStringLiteral("MinGW ranlib"), mingwRanlib });
     requiredTools.append({ QStringLiteral("MinGW strip"), mingwStrip });
     requiredTools.append({ QStringLiteral("MinGW objdump"), mingwObjdump });
-  }
-  if (localBuild && virtuaTarget) {
-    requiredTools.append({ QStringLiteral("Go for the Virtua packager"), go });
   }
   if (localBuild && linuxTarget) {
     requiredTools.append({ nativeLinuxTarget ? QStringLiteral("GCC C compiler")
@@ -1862,13 +1672,24 @@ void PipelineWorker::run(PipelineRequest request) {
     fail(error, workspace);
     return;
   }
+  const QString compilationUnitsRel = QStringLiteral("seeds/ghidra_compilation_units.json");
+  const QString compilationUnitsPath = QDir(seedsDir).filePath(QStringLiteral("ghidra_compilation_units.json"));
+  const QString ghidraCompilationUnits = QDir(proofDir).filePath(QStringLiteral("ghidra_compilation_units.json"));
+  QString compilationUnitsTomlPath;
+  if (QFileInfo(ghidraCompilationUnits).isFile()) {
+    QString copyError;
+    if (copyFileReplacing(ghidraCompilationUnits, compilationUnitsPath, copyError)) {
+      compilationUnitsTomlPath = compilationUnitsRel;
+    }
+  }
   const QString codegenToml = QDir(projectDir).filePath(QStringLiteral("codegen.toml"));
   const QString codegenTomlText = makeGameToml(
     request, game,
     QStringLiteral("game/%1").arg(game.bootFileName),
     disc.cuePath,
     QStringLiteral("seeds/ghidra_funcs.txt"),
-    QStringLiteral("generated"));
+    QStringLiteral("generated"),
+    compilationUnitsTomlPath);
   if (!writeText(codegenToml, codegenTomlText, error)) {
     fail(error, workspace);
     return;
@@ -2043,15 +1864,10 @@ void PipelineWorker::run(PipelineRequest request) {
   nextStage(QStringLiteral("Create %1 app project")
               .arg(targetPlatformDisplayName(request.targetPlatform)));
   const QString bundleId = sanitizedBundleIdentifier(game.serial, request.windowTitle);
-  // Virtua takes the PNG, like Linux: MVII has no bundle format to describe and
-  // no iconutil to describe it with. It used to fall through to the macOS arm
-  // below, where the platform metadata path is empty by construction, and the
-  // stage died on `Could not write : No file name specified` -- after Ghidra,
-  // both recompiler passes and the audit had already run.
   const QString iconPath = QDir(projectDir).filePath(
     windowsTarget ? QStringLiteral("AppIcon.ico")
-                  : (linuxTarget || virtuaTarget) ? QStringLiteral("AppIcon.png")
-                                                  : QStringLiteral("AppIcon.icns"));
+                  : linuxTarget ? QStringLiteral("AppIcon.png")
+                                : QStringLiteral("AppIcon.icns"));
   const QString platformMetadataPath = windowsTarget
     ? QDir(projectDir).filePath(QStringLiteral("AppIcon.rc"))
     : macosTarget ? QDir(projectDir).filePath(QStringLiteral("Info.plist"))
@@ -2062,7 +1878,7 @@ void PipelineWorker::run(PipelineRequest request) {
       fail(error, workspace);
       return;
     }
-  } else if (linuxTarget || virtuaTarget) {
+  } else if (linuxTarget) {
     if (!createPngIcon(iconSourcePath, iconPath, error)) {
       fail(error, workspace);
       return;
@@ -2081,11 +1897,21 @@ void PipelineWorker::run(PipelineRequest request) {
       return;
     }
   }
-  const QString gameFull = QDir(generatedDir).filePath(outStem + QStringLiteral("_full.c"));
   const QString gameDispatch = QDir(generatedDir).filePath(outStem + QStringLiteral("_dispatch.c"));
-  const QString biosFull = QDir(biosGeneratedDir).filePath(QStringLiteral("SCPH1001_full.c"));
   const QString biosDispatch = QDir(biosGeneratedDir).filePath(QStringLiteral("SCPH1001_dispatch.c"));
-  for (const auto& path : { gameFull, gameDispatch, biosFull, biosDispatch }) {
+  const QStringList gameUnits = QDir(generatedDir).entryList(
+    {outStem + QStringLiteral("_cu_*.c")}, QDir::Files, QDir::Name);
+  const QStringList biosUnits = QDir(biosGeneratedDir).entryList(
+    {QStringLiteral("SCPH1001_cu_*.c")}, QDir::Files, QDir::Name);
+  if (gameUnits.isEmpty()) {
+    fail(QStringLiteral("Game compilation units are missing under %1").arg(generatedDir), workspace);
+    return;
+  }
+  if (biosUnits.isEmpty()) {
+    fail(QStringLiteral("BIOS compilation units are missing under %1").arg(biosGeneratedDir), workspace);
+    return;
+  }
+  for (const auto& path : { gameDispatch, biosDispatch }) {
     if (!QFileInfo(path).isFile()) {
       fail(QStringLiteral("A required generated source file is missing: %1").arg(path), workspace);
       return;
@@ -2144,13 +1970,15 @@ void PipelineWorker::run(PipelineRequest request) {
     QStringLiteral("game/%1").arg(game.bootFileName),
     QStringLiteral("disc/%1").arg(sourcePackagedDiscName),
     QStringLiteral("seeds/ghidra_funcs.txt"),
-    QStringLiteral("generated"));
+    QStringLiteral("generated"),
+    compilationUnitsTomlPath);
   const QString portableCodegenToml = makeGameToml(
     request, game,
     QStringLiteral("package-resources/game/%1").arg(game.bootFileName),
     QStringLiteral("package-resources/disc/%1").arg(sourcePackagedDiscName),
     QStringLiteral("seeds/ghidra_funcs.txt"),
-    QStringLiteral("generated"));
+    QStringLiteral("generated"),
+    compilationUnitsTomlPath);
   if (!writeText(QDir(packageResourcesDir).filePath(QStringLiteral("game.toml")),
                  sourceFinalToml, error) ||
       !writeText(codegenToml, portableCodegenToml, error) ||
@@ -2171,21 +1999,13 @@ void PipelineWorker::run(PipelineRequest request) {
     return;
   }
   const QString cmakeListsPath = QDir(projectDir).filePath(QStringLiteral("CMakeLists.txt"));
-  const QString configureExample = virtuaTarget
-    ? QStringLiteral("cmake -S . -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=framework/extra/virtua/CMake/VirtuaArmToolchain.cmake -DPOWERENGINE_ROOT=/path/to/PowerEngine -DVIRTUA_LLVM_ROOT=/path/to/PowerEngine/compiler-bundle -DCMAKE_BUILD_TYPE=Release")
-    : QStringLiteral("cmake -S . -B build -DCMAKE_BUILD_TYPE=Release");
-  const QString virtuaDependencyNote = virtuaTarget
-    ? QStringLiteral(
-        "This source export does not vendor PowerEngine. `POWERENGINE_ROOT` supplies "
-        "Dash, MVII POSIX/ABI headers, the Virtua packager, and the linker script; "
-        "`VIRTUA_LLVM_ROOT` supplies the matching compiler build.\n\n")
-    : QString();
+  const QString configureExample =
+    QStringLiteral("cmake -S . -B build -DCMAKE_BUILD_TYPE=Release");
   const QString sourceReadme = QStringLiteral(
     "# %1 — PSXRecomp source export\n\n"
     "This repository was generated by PSXRecomp Studio for **%2**. It contains "
     "the evidence-backed generated C sources, the native runtime sources, the "
     "disc/BIOS package inputs, and the CMake packaging pipeline.\n\n"
-    "%4"
     "## Build\n\n"
     "```sh\n"
     "%3\n"
@@ -2195,8 +2015,7 @@ void PipelineWorker::run(PipelineRequest request) {
     "`build/steganos-package/psx-runtime/<configuration>/`, including "
     "`game.manifest.json` during the build itself.\n")
       .arg(request.windowTitle,
-           targetPlatformDisplayName(request.targetPlatform), configureExample,
-           virtuaDependencyNote);
+           targetPlatformDisplayName(request.targetPlatform), configureExample);
   if (!writeText(cmakeListsPath,
                  generatedProjectCMake(request, game, bundleName, bundleId,
                                        effectiveBiosCrc),
@@ -2371,7 +2190,7 @@ void PipelineWorker::run(PipelineRequest request) {
     return;
   }
 
-  const bool crossCompilationTarget = crossWindowsTarget || crossLinuxTarget || virtuaTarget;
+  const bool crossCompilationTarget = crossWindowsTarget || crossLinuxTarget;
   nextStage(crossCompilationTarget
     ? QStringLiteral("Cross-compile %1 app")
         .arg(targetPlatformDisplayName(request.targetPlatform))
@@ -2390,16 +2209,7 @@ void PipelineWorker::run(PipelineRequest request) {
                      << QStringLiteral("-DPSX_DEBUG_TOOLS=OFF")
                      << QStringLiteral("-DPSXRECOMP_DEPENDENCY_CACHE=%1")
                           .arg(dependencyCachePath);
-  if (virtuaTarget) {
-    configureArguments << QStringLiteral("-DCMAKE_TOOLCHAIN_FILE=%1")
-                           .arg(QDir(projectDir).filePath(QStringLiteral(
-                             "framework/extra/virtua/CMake/VirtuaArmToolchain.cmake")))
-                       << QStringLiteral("-DPSX_VIRTUA=ON")
-                       << QStringLiteral("-DPSX_SETTINGS_MENU=OFF")
-                       << QStringLiteral("-DPSX_MACOS_GIP_GAMEPAD=OFF");
-    configureArguments << QStringLiteral("-DPOWERENGINE_ROOT=%1").arg(request.powerEngineRoot)
-                       << QStringLiteral("-DVIRTUA_LLVM_ROOT=%1").arg(request.llvmRoot);
-  } else if (crossWindowsTarget) {
+  if (crossWindowsTarget) {
     configureArguments << QStringLiteral("-DCMAKE_TOOLCHAIN_FILE=%1").arg(mingwToolchainPath)
                        << QStringLiteral("-DPSX_STATIC_RUNTIME=ON")
                        << QStringLiteral("-DPSX_MACOS_GIP_GAMEPAD=OFF");
@@ -2447,11 +2257,11 @@ void PipelineWorker::run(PipelineRequest request) {
                   workspace,
                   QStringLiteral("cmake --build <build> --target psx-runtime"),
                   2 * 60 * 60 * 1000) ||
-      (!virtuaTarget && !runCommand(cmake,
+      !runCommand(cmake,
                   appInstallArguments,
                   workspace,
                   QStringLiteral("cmake --install <build> --prefix <stage>"),
-                  20 * 60 * 1000))) {
+                  20 * 60 * 1000)) {
     if (cancellationRequested()) {
       QDir(workspace).removeRecursively();
       emit cancelled();
@@ -2465,22 +2275,18 @@ void PipelineWorker::run(PipelineRequest request) {
     }
     return;
   }
-  const QString effectiveStageDir = virtuaTarget
-    ? QDir(buildDir).filePath(QStringLiteral("steganos-package/psx-runtime/Release"))
-    : stageDir;
   const QString stagedApp = directoryPackageTarget
-    ? effectiveStageDir
-    : QDir(effectiveStageDir).filePath(bundleName + QStringLiteral(".app"));
+    ? stageDir
+    : QDir(stageDir).filePath(bundleName + QStringLiteral(".app"));
   if ((!directoryPackageTarget && !QFileInfo(stagedApp).isDir()) ||
-      (directoryPackageTarget && !QFileInfo(effectiveStageDir).isDir())) {
+      (directoryPackageTarget && !QFileInfo(stageDir).isDir())) {
     fail(QStringLiteral("CMake did not stage the expected %1 output: %2")
            .arg(targetPlatformDisplayName(request.targetPlatform), stagedApp), workspace);
     return;
   }
   const QString mainExecutable = directoryPackageTarget
-    ? QDir(effectiveStageDir).filePath(bundleName +
-        (windowsTarget ? QStringLiteral(".exe") :
-         virtuaTarget ? QStringLiteral(".virtua") : QString()))
+    ? QDir(stageDir).filePath(bundleName +
+        (windowsTarget ? QStringLiteral(".exe") : QString()))
     : QDir(stagedApp).filePath(QStringLiteral("Contents/MacOS/") + bundleName);
   if (!QFileInfo(mainExecutable).isFile()) {
     fail(QStringLiteral("CMake did not stage the expected executable: %1").arg(mainExecutable), workspace);
@@ -2539,6 +2345,11 @@ void PipelineWorker::run(PipelineRequest request) {
     ? stagedApp
     : QDir(stagedApp).filePath(QStringLiteral("Contents/Resources"));
   QStringList requiredResources{
+    QStringLiteral("launcher.rml"),
+    QStringLiteral("fonts/LatoLatin-Regular.ttf"),
+    QStringLiteral("fonts/LatoLatin-Bold.ttf"),
+    QStringLiteral("img/logo.png"),
+    QStringLiteral("img/caret.png"),
     QStringLiteral("bios/SCPH1001.BIN"),
     QStringLiteral("game/%1").arg(game.bootFileName),
     QStringLiteral("disc/%1").arg(sourcePackagedDiscName),
@@ -2546,13 +2357,6 @@ void PipelineWorker::run(PipelineRequest request) {
     QStringLiteral("game.toml"),
     QStringLiteral("PSXRecomp-Proof.zip"),
   };
-  if (!virtuaTarget) {
-    requiredResources.prepend(QStringLiteral("img/caret.png"));
-    requiredResources.prepend(QStringLiteral("img/logo.png"));
-    requiredResources.prepend(QStringLiteral("fonts/LatoLatin-Bold.ttf"));
-    requiredResources.prepend(QStringLiteral("fonts/LatoLatin-Regular.ttf"));
-    requiredResources.prepend(QStringLiteral("launcher.rml"));
-  }
   for (const auto& relativePath : requiredResources) {
     const QString installedPath = QDir(resourcesDir).filePath(relativePath);
     if (!QFileInfo(installedPath).isFile()) {
@@ -2563,7 +2367,7 @@ void PipelineWorker::run(PipelineRequest request) {
     }
   }
   const QString stagedGameManifest =
-    QDir(effectiveStageDir).filePath(QStringLiteral("game.manifest.json"));
+    QDir(stageDir).filePath(QStringLiteral("game.manifest.json"));
   if (!QFileInfo(stagedGameManifest).isFile()) {
     fail(QStringLiteral("CMake did not stage game.manifest.json during the build."), workspace);
     return;
@@ -2589,27 +2393,13 @@ void PipelineWorker::run(PipelineRequest request) {
   runCommand(git,
              { QStringLiteral("-C"), request.frameworkRoot, QStringLiteral("rev-parse"), QStringLiteral("HEAD") },
              request.frameworkRoot, QStringLiteral("git -C <framework> rev-parse HEAD"), 15000, &gitOutput);
-  QByteArray powerEngineGitOutput;
-  if (virtuaTarget) {
-    runCommand(git,
-               { QStringLiteral("-C"), request.powerEngineRoot,
-                 QStringLiteral("rev-parse"), QStringLiteral("HEAD") },
-               request.powerEngineRoot,
-               QStringLiteral("git -C <PowerEngine> rev-parse HEAD"), 15000,
-               &powerEngineGitOutput);
-  }
-  const QString targetArchitecture = virtuaTarget
-    ? QStringLiteral("armv7a-none-eabi")
-    : nativeWindowsTarget
+  const QString targetArchitecture = nativeWindowsTarget
     ? QStringLiteral("x86_64-pc-windows-msvc")
     : crossWindowsTarget ? QStringLiteral("x86_64-w64-mingw32")
     : nativeLinuxTarget ? QStringLiteral("x86_64-linux-gnu")
     : crossLinuxTarget ? QStringLiteral("x86_64-unknown-linux-gnu")
                   : QSysInfo::currentCpuArchitecture();
-  const QString compilerVersion = virtuaTarget
-    ? versionText(virtuaCompilerPath(request.llvmRoot),
-                  { QStringLiteral("--version") }).section('\n', 0, 0)
-    : nativeWindowsTarget
+  const QString compilerVersion = nativeWindowsTarget
     ? versionText(msvcCl, {}).section('\n', 0, 0)
     : crossWindowsTarget
       ? versionText(mingwGcc, { QStringLiteral("--version") }).section('\n', 0, 0)
@@ -2617,18 +2407,14 @@ void PipelineWorker::run(PipelineRequest request) {
       ? versionText(linuxGcc, { QStringLiteral("--version") }).section('\n', 0, 0)
       : versionText(hostClang,
                     { QStringLiteral("--version") }).section('\n', 0, 0);
-  const QString sdl2Source = virtuaTarget
-    ? QStringLiteral("bundled Virtua SDL compatibility surface")
-    : nativeWindowsTarget
+  const QString sdl2Source = nativeWindowsTarget
     ? QStringLiteral("SDL2-2.32.10.tar.gz (MSVC static source build)")
     : crossWindowsTarget
       ? QStringLiteral("SDL2-devel-2.32.10-mingw.tar.gz")
     : linuxTarget
       ? QStringLiteral("pysdl2_dll-2.32.10-py2.py3-none-manylinux_2_28_x86_64.whl")
       : QStringLiteral("host pkg-config");
-  const QString sdl2Sha256 = virtuaTarget
-    ? QString()
-    : nativeWindowsTarget
+  const QString sdl2Sha256 = nativeWindowsTarget
     ? QString::fromLatin1(kSdl2SourceSha256)
     : crossWindowsTarget
       ? QStringLiteral("83a5d74012311edc3c0d40ea6faecbe57ad692aa033fa5dc273cc937e3938ff2")
@@ -2657,8 +2443,6 @@ void PipelineWorker::run(PipelineRequest request) {
     { QStringLiteral("macos_gip_gamepad_compiled"), gipBackendCompiled },
     { QStringLiteral("libusb_version"), libusbVersion },
     { QStringLiteral("framework_commit"), QString::fromUtf8(gitOutput).trimmed() },
-    { QStringLiteral("powerengine_commit"), QString::fromUtf8(powerEngineGitOutput).trimmed() },
-    { QStringLiteral("powerengine_external_bindings"), virtuaTarget },
     { QStringLiteral("source_repository_commit"), sourceCommit },
     { QStringLiteral("cmake"), versionText(cmake, { QStringLiteral("--version") }).section('\n', 0, 0) },
     { QStringLiteral("generator"), nativeWindowsTarget
@@ -2701,113 +2485,6 @@ void PipelineWorker::run(PipelineRequest request) {
   const QString proofArchive = QDir(resourcesDir).filePath(QStringLiteral("PSXRecomp-Proof.zip"));
   if (!createProofArchive(proofDir, proofArchive, error)) {
     fail(error, workspace);
-    return;
-  }
-
-  if (virtuaTarget) {
-    nextStage(QStringLiteral("Verify Virtua ARM package"));
-    QFile executableFile(mainExecutable);
-    if (!executableFile.open(QIODevice::ReadOnly)) {
-      fail(QStringLiteral("The staged Virtua ARM executable could not be read."), workspace);
-      return;
-    }
-    const QByteArray virtuaHeader = executableFile.read(56);
-    executableFile.close();
-    if (virtuaHeader.size() != 56 ||
-        qFromLittleEndian<quint32>(virtuaHeader.constData()) != 0x56495254u ||
-        qFromLittleEndian<quint32>(virtuaHeader.constData() + 4) != 3u) {
-      fail(QStringLiteral("The staged executable is not a Virtua v3 image."), workspace);
-      return;
-    }
-    const quint64 virtuaFlags = qFromLittleEndian<quint64>(virtuaHeader.constData() + 48);
-    const bool arm32 = ((virtuaFlags >> 8u) & 0xffu) == 4u;
-    const bool cooperative = (virtuaFlags & (1u << 1u)) != 0u;
-    if (!arm32 || !cooperative) {
-      fail(QStringLiteral("The staged Virtua image is not cooperative ARM32 code."), workspace);
-      return;
-    }
-    const QString executableHash = sha256File(mainExecutable, error);
-    const QJsonObject virtuaProof{
-      { QStringLiteral("schema"), 1 },
-      { QStringLiteral("platform"), QStringLiteral("virtua") },
-      { QStringLiteral("architecture"), QStringLiteral("arm32") },
-      { QStringLiteral("format"), QStringLiteral("virtua-v3") },
-      { QStringLiteral("cooperative_scheduler"), cooperative },
-      { QStringLiteral("executable"), QFileInfo(mainExecutable).fileName() },
-      { QStringLiteral("executable_sha256"), executableHash },
-      { QStringLiteral("renderer"), QStringLiteral("software via /dev/fb0") },
-      { QStringLiteral("audio"), QStringLiteral("queued PCM via /dev/dac0") },
-      { QStringLiteral("input"), QStringLiteral("event-backed /dev/input0") },
-      { QStringLiteral("executed_during_verification"), false },
-    };
-    if (executableHash.isEmpty() ||
-        !writeJson(QDir(proofDir).filePath(QStringLiteral("virtua_binary_verification.json")),
-                   virtuaProof, error) ||
-        !createProofArchive(proofDir, proofArchive, error)) {
-      fail(error, workspace);
-      return;
-    }
-
-    nextStage(QStringLiteral("Deliver Virtua ARM package"));
-    if (request.exportAsZip) {
-      const QString outputArchive = QDir(request.outputDirectory).filePath(exportOutputName(request));
-      if (!publishPackageZip(effectiveStageDir, {}, outputArchive)) {
-        if (cancellationRequested()) {
-          QDir(workspace).removeRecursively();
-          emit cancelled();
-        } else {
-          fail(error.isEmpty() ? QStringLiteral("The Virtua ARM ZIP could not be delivered.") : error,
-               workspace);
-        }
-        return;
-      }
-      emit logLine(QStringLiteral("Virtua ARM ZIP created: %1").arg(outputArchive));
-      QDir(workspace).removeRecursively();
-      emit completed(outputArchive);
-      return;
-    }
-
-    const QString outputPackage = QDir(request.outputDirectory).filePath(exportOutputName(request));
-    const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    const QString stagingPackage = outputPackage + QStringLiteral(".psxrecomp-new-") + token;
-    const QString backupPackage = outputPackage + QStringLiteral(".psxrecomp-old-") + token;
-    removeExportEntry(stagingPackage);
-    removeExportEntry(backupPackage);
-    if (!copyDirectoryTree(effectiveStageDir, stagingPackage, error)) {
-      fail(error, workspace);
-      return;
-    }
-    const bool existed = QFileInfo::exists(outputPackage) || QFileInfo(outputPackage).isSymLink();
-    if (existed && !request.overwriteOutput) {
-      removeExportEntry(stagingPackage);
-      fail(QStringLiteral("The Virtua ARM output already exists and overwrite was not approved: %1")
-             .arg(outputPackage), workspace);
-      return;
-    }
-    if (existed && !QDir().rename(outputPackage, backupPackage)) {
-      removeExportEntry(stagingPackage);
-      fail(QStringLiteral("Could not preserve the previous Virtua ARM package."), workspace);
-      return;
-    }
-    if (!QDir().rename(stagingPackage, outputPackage)) {
-      if (existed) QDir().rename(backupPackage, outputPackage);
-      fail(QStringLiteral("Could not publish the verified Virtua ARM package."), workspace);
-      return;
-    }
-    const QString deliveredExecutable = QDir(outputPackage).filePath(
-      bundleName + QStringLiteral(".virtua"));
-    if (sha256File(deliveredExecutable, error) != executableHash) {
-      const QString failedPackage = outputPackage + QStringLiteral(".failed-") + token;
-      QDir().rename(outputPackage, failedPackage);
-      if (existed) QDir().rename(backupPackage, outputPackage);
-      fail(QStringLiteral("The delivered Virtua ARM executable changed during publication; the failed copy remains at %1")
-             .arg(failedPackage), workspace);
-      return;
-    }
-    if (existed) QDir(backupPackage).removeRecursively();
-    emit logLine(QStringLiteral("Virtua ARM package created: %1").arg(outputPackage));
-    QDir(workspace).removeRecursively();
-    emit completed(outputPackage);
     return;
   }
 
@@ -3664,2365 +3341,6 @@ void PipelineWorker::run(PipelineRequest request) {
                       outputApp));
   QDir(workspace).removeRecursively();
   emit completed(outputApp);
-}
-
-void PipelineWorker::runGba(const PipelineRequest& request) {
-  constexpr auto kCanonicalGbaBiosSha256 = "fd2547724b505f487e6dcb29ec2ecff3af35a841a77ab2e85fd87350abd36570";
-  constexpr auto kZeroGbaBiosSha256 = "4fe7b59af6de3b665b67788cc2f99892ab827efae3a467342b3bb4e3bc8e5bfe";
-  const bool windowsTarget = request.targetPlatform == TargetPlatform::Windows;
-  const bool linuxTarget = request.targetPlatform == TargetPlatform::Linux;
-  const bool macosTarget = request.targetPlatform == TargetPlatform::MacOS;
-  const bool virtuaTarget = request.targetPlatform == TargetPlatform::VirtuaArm;
-  const bool sourceExport = request.exportMode == ExportMode::Source;
-  const bool remoteCiBuild = request.exportMode == ExportMode::Build &&
-                             request.buildBackend == BuildBackend::RemoteCi;
-  const bool localBuild = request.exportMode == ExportMode::Build && !remoteCiBuild;
-  const bool signingRequested = localBuild && macosTarget &&
-    !request.certificatePath.trimmed().isEmpty() && !request.certificatePassword.isEmpty();
-  // Ghidra has no stage of its own: it runs inside the recompilation stage,
-  // once per pass, because it is seeded from what that pass translated.
-  const int totalStages = localBuild ? 10 : 7;
-  int stage = 0;
-  QString workspace;
-  QString error;
-  auto nextStage = [&](const QString& name) {
-    emit stageChanged(name, ++stage, totalStages);
-    emit logLine(QStringLiteral("\n=== %1 ===").arg(name));
-  };
-  auto fail = [&](const QString& message) {
-    emit logLine(QStringLiteral("ERROR: %1").arg(message));
-    emit failed(message, workspace);
-  };
-  auto cancelledOut = [&]() {
-    if (!workspace.isEmpty()) QDir(workspace).removeRecursively();
-    emit cancelled();
-  };
-
-  nextStage(QStringLiteral("Validate GBA inputs"));
-  if (request.targetPlatform == TargetPlatform::All) {
-    fail(QStringLiteral("The All platform selection must be expanded before the GBA pipeline starts."));
-    return;
-  }
-  // Virtua is the one cross target here: the package is an ARMv7 .virtua built
-  // with PowerEngine's own toolchain, so it does not build "on its target
-  // operating system" and never could. The other three are desktop builds of
-  // gbarecomp's host runtime and do.
-  if (localBuild && !virtuaTarget && request.targetPlatform != hostTargetPlatform()) {
-    fail(QStringLiteral("GBA packages build on their target operating system. Enable CI for %1 or export source.")
-           .arg(targetPlatformDisplayName(request.targetPlatform)));
-    return;
-  }
-  if (virtuaTarget && !isPowerEngineRoot(request.powerEngineRoot)) {
-    fail(QStringLiteral("The selected PowerEngine root does not contain the canonical Virtua/MVII sources."));
-    return;
-  }
-  if (virtuaTarget && !isVirtuaLlvmRoot(request.llvmRoot)) {
-    fail(QStringLiteral("The selected LLVM root is not a complete PowerEngine compiler bundle."));
-    return;
-  }
-  GbaDescription game;
-  if (!inspectGbaRom(request.romPath, game, error)) {
-    fail(error);
-    return;
-  }
-  if (!game.warning.isEmpty()) emit logLine(QStringLiteral("Warning: %1").arg(game.warning));
-  if (request.skipBiosBoot) {
-    // gbarecomp recompiles and dispatches the BIOS; every game's first frames
-    // are real BIOS frames. There is no boot-skip path to honour here, so a
-    // request that asks for one is rejected rather than silently ignored.
-    fail(QStringLiteral("The GBA pipeline recompiles and dispatches the BIOS; boot skip is not available."));
-    return;
-  }
-  if (request.biosPath.trimmed().isEmpty() ||
-      QFileInfo(request.biosPath).size() != 16 * 1024) {
-    fail(QStringLiteral("A canonical 16,384-byte GBA BIOS is required: it is statically recompiled and dispatched, not stubbed or skipped."));
-    return;
-  }
-  const QString iconSourcePath = request.iconPath.trimmed().isEmpty()
-    ? QStringLiteral(":/psxrecomp/studio/resources/psxrecomp-studio.svg")
-    : request.iconPath;
-  if (!QFileInfo(iconSourcePath).isFile() && !iconSourcePath.startsWith(QStringLiteral(":/"))) {
-    fail(QStringLiteral("The selected app icon is not readable."));
-    return;
-  }
-  const QString bundleName = cleanBundleName(request.windowTitle);
-  if (bundleName.isEmpty()) {
-    fail(QStringLiteral("The window title cannot be converted to a valid app name."));
-    return;
-  }
-  if (!QFileInfo(request.outputDirectory).isDir() ||
-      !QFileInfo(request.outputDirectory).isWritable()) {
-    fail(QStringLiteral("Select a writable output directory."));
-    return;
-  }
-  const QString gbarecompRoot = QDir(request.frameworkRoot).filePath(QStringLiteral("extra/gbarecomp"));
-  const QString biosRecompilerConfig =
-    QDir(gbarecompRoot).filePath(QStringLiteral("bios/gba_bios.toml"));
-  const QString ghidraScriptsPath = QDir(request.frameworkRoot).filePath(QStringLiteral("tools/ghidra"));
-  if (!QFileInfo(QDir(gbarecompRoot).filePath(QStringLiteral("CMakeLists.txt"))).isFile() ||
-      !QFileInfo(QDir(gbarecompRoot).filePath(QStringLiteral("tools/gba_recompile/main.cpp"))).isFile()) {
-    fail(QStringLiteral("The framework does not contain the gbarecomp static recompiler."));
-    return;
-  }
-  if (!QFileInfo(biosRecompilerConfig).isFile()) {
-    fail(QStringLiteral("The curated gbarecomp BIOS recompilation config is missing; the BIOS cannot be stubbed."));
-    return;
-  }
-  // The MVII half of a Virtua package: gba-to-mvii compiles gbarecomp's
-  // emulation sources for Cortex-A7 and links them against MVII's devices, and
-  // it resolves PowerEngine through extra/virtua/CMake — which is why both
-  // travel into the generated project, in that same relative arrangement.
-  const QString gbaToMviiRoot =
-    QDir(request.frameworkRoot).filePath(QStringLiteral("extra/gba-to-mvii"));
-  const QString virtuaRoot =
-    QDir(request.frameworkRoot).filePath(QStringLiteral("extra/virtua"));
-  const QString elfInfoTool = QDir(virtuaRoot).filePath(QStringLiteral("tools/elfinfo.py"));
-  if (virtuaTarget) {
-    for (const auto& required : { QDir(gbaToMviiRoot).filePath(QStringLiteral("CMakeLists.txt")),
-                                  QDir(gbaToMviiRoot).filePath(QStringLiteral("src/mvii/main.cpp")),
-                                  QDir(virtuaRoot).filePath(QStringLiteral("CMake/VirtuaArmToolchain.cmake")),
-                                  QDir(virtuaRoot).filePath(QStringLiteral("CMake/VirtuaPowerEngine.cmake")),
-                                  elfInfoTool }) {
-      if (!QFileInfo(required).isFile()) {
-        fail(QStringLiteral("The framework does not contain the MVII GBA runtime: %1 is missing.")
-               .arg(required));
-        return;
-      }
-    }
-  }
-  for (const auto& script : { QStringLiteral("SeedGbaEntry.java"),
-                              QStringLiteral("ExportGbaAnalysis.java") }) {
-    if (!QFileInfo(QDir(ghidraScriptsPath).filePath(script)).isFile()) {
-      fail(QStringLiteral("The Ghidra script %1 is missing from the framework.").arg(script));
-      return;
-    }
-  }
-  if (localBuild && macosTarget &&
-      request.certificatePath.trimmed().isEmpty() != request.certificatePassword.isEmpty()) {
-    fail(QStringLiteral("Select both a PFX certificate and password, or leave both empty."));
-    return;
-  }
-  if (signingRequested && !QFileInfo(request.certificatePath).isFile()) {
-    fail(QStringLiteral("The selected PFX signing certificate is not readable."));
-    return;
-  }
-  const QString analyzeHeadless = ghidraAnalyzeHeadlessPath(request.ghidraHome);
-  if (analyzeHeadless.isEmpty()) {
-    fail(QStringLiteral("The selected Ghidra installation does not provide analyzeHeadless. GBA exports are seeded from Ghidra's analysis."));
-    return;
-  }
-  const QString cmake = findExecutable(QStringLiteral("cmake"));
-  const QString git = findExecutable(QStringLiteral("git"));
-  const QString ninja = hostTargetPlatform() != TargetPlatform::Windows
-    ? findExecutable(QStringLiteral("ninja")) : QString();
-  if (cmake.isEmpty() || git.isEmpty() ||
-      (hostTargetPlatform() != TargetPlatform::Windows && ninja.isEmpty())) {
-    fail(QStringLiteral("GBA exports require CMake, Git, and (on non-Windows hosts) Ninja to build the gbarecomp recompiler."));
-    return;
-  }
-  // The Virtua package is cross-compiled with a single-configuration generator
-  // whatever the host is, and PowerEngine's packager is a Go program built from
-  // source on first use. Python reads the linked ELF afterwards: the compiler
-  // bundle ships no llvm-nm and macOS nm cannot read ELF at all.
-  const QString virtuaNinja = localBuild && virtuaTarget
-    ? (ninja.isEmpty() ? findExecutable(QStringLiteral("ninja")) : ninja) : QString();
-  const QString go = localBuild && virtuaTarget
-    ? findExecutable(QStringLiteral("go")) : QString();
-  const QString python = localBuild && virtuaTarget ? findWorkingPython() : QString();
-  if (localBuild && virtuaTarget) {
-    const QList<QPair<QString, QString>> virtuaTools{
-      { QStringLiteral("Ninja"), virtuaNinja },
-      { QStringLiteral("Go for the Virtua packager"), go },
-      { QStringLiteral("Python 3 for ELF verification"), python },
-    };
-    for (const auto& tool : virtuaTools) {
-      if (tool.second.isEmpty()) {
-        fail(QStringLiteral("A Virtua ARM GBA package requires %1 on the build host.")
-               .arg(tool.first));
-        return;
-      }
-    }
-  }
-  const QString rcodesign = signingRequested ? findRcodesign() : QString();
-  if (signingRequested && rcodesign.isEmpty()) {
-    fail(QStringLiteral("rcodesign is required for PFX-signed macOS GBA apps."));
-    return;
-  }
-
-  const QString romSha1 = sha1File(request.romPath, error);
-  const QString romSha256 = sha256File(request.romPath, error);
-  const quint32 romCrc32 = crc32File(request.romPath, error);
-  const QString biosSha1 = sha1File(request.biosPath, error);
-  const QString biosSha256 = sha256File(request.biosPath, error);
-  const quint32 biosCrc32 = crc32File(request.biosPath, error);
-  if (romSha1.isEmpty() || romSha256.isEmpty() || biosSha1.isEmpty() || biosSha256.isEmpty()) {
-    fail(error.isEmpty() ? QStringLiteral("The GBA inputs could not be hashed.") : error);
-    return;
-  }
-  if (biosSha256.compare(QString::fromLatin1(kCanonicalGbaBiosSha256),
-                         Qt::CaseInsensitive) != 0) {
-    const bool zeroImage = biosSha256.compare(QString::fromLatin1(kZeroGbaBiosSha256),
-                                              Qt::CaseInsensitive) == 0;
-    fail(zeroImage
-      ? QStringLiteral("The selected GBA BIOS is the old all-zero placeholder. Select the canonical gba_bios.bin dump.")
-      : QStringLiteral("The selected GBA BIOS is not canonical. Expected SHA-256 %1, got %2.")
-          .arg(QString::fromLatin1(kCanonicalGbaBiosSha256), biosSha256));
-    return;
-  }
-  emit logLine(QStringLiteral("GBA ROM: %1 · %2 · %3 bytes · entry %4")
-    .arg(game.title, game.gameCode).arg(game.romSize)
-    .arg(QStringLiteral("0x%1").arg(game.entryTarget, 8, 16, QLatin1Char('0'))));
-  emit logLine(QStringLiteral("GBA BIOS: canonical (SHA-256 %1), recompiled and dispatched — never stubbed")
-                 .arg(biosSha256));
-  emit logLine(QStringLiteral("Runtime: gbarecomp static recompilation (ARMv4T, ARM+THUMB interworking)"));
-
-  nextStage(QStringLiteral("Prepare gbarecomp source workspace"));
-  const QString preferredWorkspaceRoot =
-    QDir(QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation))
-      .filePath(QStringLiteral("org.psxrecomp.studio/workspaces"));
-  const QString fallbackWorkspaceRoot =
-    QDir(QDir::tempPath()).filePath(QStringLiteral("org.psxrecomp.studio/workspaces"));
-  std::unique_ptr<QTemporaryDir> temporary;
-  for (const QString& root : { preferredWorkspaceRoot, fallbackWorkspaceRoot }) {
-    if (!QDir().mkpath(root)) continue;
-    auto candidate = std::make_unique<QTemporaryDir>(
-      QDir(root).filePath(QStringLiteral("psxrecomp-gbarecomp-XXXXXX")));
-    candidate->setAutoRemove(false);
-    if (candidate->isValid()) {
-      temporary = std::move(candidate);
-      break;
-    }
-  }
-  if (!temporary) {
-    fail(QStringLiteral("Could not create a GBA build workspace in the cache or temporary directory."));
-    return;
-  }
-  workspace = temporary->path();
-  const QString projectDir = QDir(workspace).filePath(QStringLiteral("project"));
-  const QString inputsDir = QDir(projectDir).filePath(QStringLiteral("package_inputs"));
-  const QString proofDir = QDir(projectDir).filePath(QStringLiteral("proof"));
-  const QString buildDir = QDir(workspace).filePath(QStringLiteral("build"));
-  const QString stageDir = QDir(workspace).filePath(QStringLiteral("stage"));
-  const QString ghidraDir = QDir(workspace).filePath(QStringLiteral("ghidra"));
-  const QString generatedDir = QDir(projectDir).filePath(QStringLiteral("generated"));
-  const QString recompilerDir = QDir(projectDir).filePath(QStringLiteral("recompiler"));
-  const QString seedsDir = QDir(recompilerDir).filePath(QStringLiteral("seeds"));
-  const QString resourcesDir = QDir(projectDir).filePath(QStringLiteral("resources"));
-  const QString sourceDir = QDir(projectDir).filePath(QStringLiteral("src"));
-  for (const auto& path : { projectDir, inputsDir, proofDir, buildDir, stageDir,
-                            ghidraDir, generatedDir, recompilerDir, seedsDir,
-                            resourcesDir, sourceDir }) {
-    if (!QDir().mkpath(path)) {
-      fail(QStringLiteral("Could not create workspace directory %1.").arg(path));
-      return;
-    }
-  }
-  const QString projectGbarecompDir = QDir(projectDir).filePath(QStringLiteral("gbarecomp"));
-  if (!copySourceDirectory(gbarecompRoot, projectGbarecompDir, error) ||
-      !copyFileReplacing(request.romPath, QDir(inputsDir).filePath(QStringLiteral("game.gba")), error) ||
-      !copyFileReplacing(request.biosPath, QDir(inputsDir).filePath(QStringLiteral("gba_bios.bin")), error) ||
-      !createPngIcon(iconSourcePath, QDir(projectDir).filePath(QStringLiteral("AppIcon.png")), error)) {
-    fail(error);
-    return;
-  }
-  // gba-to-mvii includes ../virtua/CMake/VirtuaPowerEngine.cmake by relative
-  // path, so the two have to land in the project the way they sit in the
-  // framework. Nothing from PowerEngine itself is copied: the toolchain,
-  // sysroot, Dash, linker script and packager are all resolved out of
-  // POWERENGINE_ROOT at configure time.
-  if (virtuaTarget) {
-    const QString frameworkExtra =
-      QDir(projectDir).filePath(QStringLiteral("framework/extra"));
-    if (!copySourceDirectory(gbaToMviiRoot,
-                             QDir(frameworkExtra).filePath(QStringLiteral("gba-to-mvii")), error) ||
-        !copySourceDirectory(virtuaRoot,
-                             QDir(frameworkExtra).filePath(QStringLiteral("virtua")), error)) {
-      fail(error);
-      return;
-    }
-  }
-  if (macosTarget &&
-      !createIcns(iconSourcePath, workspace,
-                  QDir(projectDir).filePath(QStringLiteral("AppIcon.icns")), error)) {
-    fail(error);
-    return;
-  }
-  const QString bundleId = sanitizedBundleIdentifier(
-    game.gameCode.isEmpty() ? QStringLiteral("gba") : game.gameCode, request.windowTitle);
-  // src/main.cpp is the desktop entry point: it opens gbarecomp's host window,
-  // audio device and TOML loader. The MVII image has its own main in
-  // framework/extra/gba-to-mvii/src/mvii, so a Virtua export does not get one —
-  // an unbuilt second entry point in the tree would only invite the question of
-  // which one runs.
-  if (!virtuaTarget &&
-      !writeText(QDir(sourceDir).filePath(QStringLiteral("main.cpp")),
-                 generatedGbaMainCpp(bundleName, romSha1, romCrc32), error)) {
-    fail(error);
-    return;
-  }
-  if (!writeText(QDir(resourcesDir).filePath(QStringLiteral("game.toml")),
-                 generatedGbaGameToml(request, game, romSha1, romCrc32, biosSha1,
-                                      biosCrc32, /*biosHle=*/false), error) ||
-      !writeText(QDir(recompilerDir).filePath(QStringLiteral("game.recomp.toml")),
-                 generatedGbaRecompilerToml(request, game, romSha1), error) ||
-      !writeJson(QDir(projectDir).filePath(QStringLiteral("game.manifest.json")),
-                 gameManifestForRequest(request), error) ||
-      !writeText(QDir(projectDir).filePath(QStringLiteral(".gitignore")),
-                 QStringLiteral("/build*/\n.DS_Store\n"), error)) {
-    fail(error);
-    return;
-  }
-  if (macosTarget &&
-      !writeText(QDir(projectDir).filePath(QStringLiteral("Info.plist")),
-                 generatedGbaInfoPlist(bundleName, bundleId), error)) {
-    fail(error);
-    return;
-  }
-
-  const QJsonObject inputProof{
-    { QStringLiteral("schema"), 3 },
-    { QStringLiteral("system"), QStringLiteral("gba") },
-    { QStringLiteral("runtime"), QStringLiteral("gbarecomp") },
-    { QStringLiteral("execution"), QStringLiteral("static-recompilation") },
-    { QStringLiteral("build_entry"), QStringLiteral("cmake --build --target gba-runtime") },
-    { QStringLiteral("title"), game.title },
-    { QStringLiteral("game_code"), game.gameCode },
-    { QStringLiteral("entry_word"), QStringLiteral("0x%1").arg(game.entryWord, 8, 16, QLatin1Char('0')) },
-    { QStringLiteral("entry_target"), QStringLiteral("0x%1").arg(game.entryTarget, 8, 16, QLatin1Char('0')) },
-    { QStringLiteral("rom_size"), QString::number(game.romSize) },
-    { QStringLiteral("rom_sha1"), romSha1 },
-    { QStringLiteral("rom_sha256"), romSha256 },
-    { QStringLiteral("rom_crc32"), QStringLiteral("%1").arg(romCrc32, 8, 16, QLatin1Char('0')) },
-    { QStringLiteral("bios_size"), QString::number(16 * 1024) },
-    { QStringLiteral("bios_sha1"), biosSha1 },
-    { QStringLiteral("bios_sha256"), biosSha256 },
-    { QStringLiteral("bios_crc32"), QStringLiteral("%1").arg(biosCrc32, 8, 16, QLatin1Char('0')) },
-    { QStringLiteral("menu"), true },
-    { QStringLiteral("controller_default"), QStringLiteral("automatic gamepad with keyboard merge") },
-    { QStringLiteral("scanlines_optional"), true },
-    { QStringLiteral("scanlines_default"), false },
-    { QStringLiteral("macos_gip_requested"), macosTarget && request.macosGipGamepad },
-    { QStringLiteral("bios_mode"), QStringLiteral("recompiled_dispatched") },
-    { QStringLiteral("package_contains_rom_or_bios"), true },
-  };
-  if (!writeJson(QDir(proofDir).filePath(QStringLiteral("gba_inputs.json")), inputProof, error) ||
-      !writeJson(QDir(proofDir).filePath(QStringLiteral("request.json")), request.toJson(false), error)) {
-    fail(error);
-    return;
-  }
-
-  // ── Ghidra ─────────────────────────────────────────────────────────────
-  // Ghidra does not run as its own stage. It runs inside the recompilation loop
-  // below, once per pass, seeded with the extents that pass proved are code.
-  //
-  // It used to run first, over the whole cartridge, before the recompiler had
-  // said anything. A .gba image has no section table, so that asked it to find
-  // functions in megabytes of undifferentiated bytes, and on ARMv4T that
-  // mistake compounds: an orphan THUMB `bl.lo` halfword — one halfword in 32 of
-  // arbitrary data — decodes as a call through LR, so ArmAnalyzer disassembles
-  // at whatever the constant propagator holds in LR and creates a function
-  // there, which is analyzed in turn. Measured on a 16 MB cartridge: 119,202
-  // functions, 113,516 COMPUTED_CALL references against 22 real COMPUTED_JUMP
-  // switch targets, bodies over 53% of the image, 26 minutes of analysis. Of
-  // the 131,737 reference sources it recorded, 426 landed on an instruction
-  // gba_recompile had decoded, and 374 of those were themselves orphan `bl.lo`
-  // halfwords; not one candidate passed a seed rule. The stage cost 26 minutes
-  // to contribute nothing.
-  //
-  // So the dependency is inverted. The recompiler runs first from the entry
-  // point alone and reports the extents its recursive descent proved reachable;
-  // those extents seed the analysis. Ghidra still follows flow wherever it
-  // leads — resolving the switch and pointer targets gba_recompile could not is
-  // the only reason it is here — but it starts only from instructions the
-  // recompiler decoded, so the cascade has nowhere to begin. Each pass widens
-  // the extents, so each pass gets its own analysis, until admission reaches a
-  // fixed point.
-  const QString projectName = QStringLiteral("GBA_%1").arg(
-    game.gameCode.isEmpty() ? sanitizedFileStem(request.windowTitle)
-                            : sanitizedFileStem(game.gameCode));
-  const QString romForAnalysis = QDir(inputsDir).filePath(QStringLiteral("game.gba"));
-  constexpr quint32 kGbaRomBase = 0x08000000u;
-  const quint32 romEndExclusive =
-    kGbaRomBase + static_cast<quint32>(game.romSize);
-  QJsonArray ghidraPassRecords;
-  int modeConflictCount = 0;
-  // Runs one analysis over `extentsPath` and leaves the verified manifest in
-  // `manifest`. Every failure is terminal: a manifest that does not match these
-  // cartridge bytes, or one truncated by a timeout, would be a proof artifact
-  // that quietly says less than it appears to.
-  auto analyzeWithGhidra = [&](int iteration, const QString& extentsPath,
-                               QJsonObject& manifest) -> bool {
-    const QString ghidraAnalysisPath = QDir(proofDir).filePath(
-      QStringLiteral("ghidra_analysis_pass%1.json").arg(iteration));
-    const QStringList ghidraArgs{
-      ghidraDir,
-      projectName,
-      QStringLiteral("-import"), romForAnalysis,
-      QStringLiteral("-overwrite"),
-      QStringLiteral("-processor"), QStringLiteral("ARM:LE:32:v4t"),
-      QStringLiteral("-loader"), QStringLiteral("BinaryLoader"),
-      QStringLiteral("-loader-baseAddr"), hex32(kGbaRomBase),
-      QStringLiteral("-loader-blockName"), QStringLiteral("ROM"),
-      QStringLiteral("-scriptPath"), ghidraScriptsPath,
-      QStringLiteral("-prescript"), QStringLiteral("SeedGbaEntry.java"),
-        hex32(kGbaRomBase), hex32(game.entryTarget), extentsPath,
-      QStringLiteral("-postscript"), QStringLiteral("ExportGbaAnalysis.java"),
-        ghidraAnalysisPath, hex32(game.entryTarget), hex32(kGbaRomBase),
-        hex32(romEndExclusive),
-      QStringLiteral("-analysisTimeoutPerFile"), QStringLiteral("5400"),
-      // One CPU, deliberately. This manifest is a proof artifact — seeds are
-      // admitted from it — so two runs over the same cartridge bytes have to
-      // produce the same file, and Ghidra's analyzers mutate the program they are
-      // reading. It is affordable now only because the extents cut the work by
-      // more than an order of magnitude; it was not affordable over 16 MB.
-      QStringLiteral("-max-cpu"), QStringLiteral("1"),
-    };
-    QByteArray ghidraOutput;
-    if (!runCommand(analyzeHeadless, ghidraArgs, workspace,
-                    QStringLiteral("analyzeHeadless <workspace> %1 -import game.gba [ARMv4T analysis, pass %2]")
-                      .arg(projectName).arg(iteration),
-                    110 * 60 * 1000, &ghidraOutput)) {
-      if (cancellationRequested()) cancelledOut();
-      else fail(QStringLiteral("Ghidra headless analysis failed on pass %1.").arg(iteration));
-      return false;
-    }
-    // A timed-out analysis still writes a manifest, and that manifest is a
-    // truncated function list. Trusting it would silently shrink the seed source,
-    // so the timeout is fatal rather than a warning.
-    if (QString::fromUtf8(ghidraOutput).contains(QStringLiteral("Analysis timed out"))) {
-      fail(QStringLiteral("Ghidra's analysis timed out on pass %1, so its function list is incomplete and cannot be used as a seed source.").arg(iteration));
-      return false;
-    }
-    if (!QFileInfo(ghidraAnalysisPath).isFile()) {
-      fail(QStringLiteral("Ghidra did not produce its analysis manifest on pass %1.").arg(iteration));
-      return false;
-    }
-    const auto ghidraDocument = readJson(ghidraAnalysisPath, error);
-    if (ghidraDocument.isNull()) {
-      fail(error);
-      return false;
-    }
-    manifest = ghidraDocument.object();
-    const QJsonObject& ghidraObject = manifest;
-    QString observedEntry = ghidraObject.value(QStringLiteral("entry")).toString().toLower();
-    observedEntry.remove(QStringLiteral("0x"));
-    const QString expectedEntry =
-      QStringLiteral("%1").arg(game.entryTarget, 8, 16, QLatin1Char('0')).toLower();
-    const QString observedLanguage = ghidraObject.value(QStringLiteral("language")).toString();
-    const QString observedEntryFunction =
-      ghidraObject.value(QStringLiteral("entry_function")).toString();
-    bool romBlockMatches = false;
-    for (const auto& blockValue : ghidraObject.value(QStringLiteral("memory_blocks")).toArray()) {
-      const auto block = blockValue.toObject();
-      if (block.value(QStringLiteral("name")).toString() != QStringLiteral("ROM")) continue;
-      bool okStart = false;
-      const quint32 startAddress =
-        block.value(QStringLiteral("start")).toString().toUInt(&okStart, 16);
-      romBlockMatches = okStart && startAddress == kGbaRomBase &&
-                        block.value(QStringLiteral("initialized")).toBool();
-      break;
-    }
-    // Cross-check Ghidra's decoded entry word against the cartridge bytes so the
-    // analysis is tied to this exact image and not a stale project.
-    QString observedWord;
-    QString expectedWord;
-    bool entryWordMatches = false;
-    const auto entryInstructions = ghidraObject.value(QStringLiteral("entry_instructions")).toArray();
-    if (!entryInstructions.isEmpty() && game.entryTarget >= kGbaRomBase) {
-      observedWord = entryInstructions.first().toObject()
-                       .value(QStringLiteral("word_little_endian")).toString().toUpper();
-      QFile romFile(request.romPath);
-      if (romFile.open(QIODevice::ReadOnly) &&
-          romFile.seek(game.entryTarget - kGbaRomBase)) {
-        const QByteArray word = romFile.read(4);
-        if (word.size() == 4) {
-          expectedWord = hex32(qFromLittleEndian<quint32>(
-            reinterpret_cast<const uchar*>(word.constData())));
-          entryWordMatches = observedWord == expectedWord;
-        }
-      }
-    }
-    const int ghidraSchema = ghidraObject.value(QStringLiteral("schema")).toInt();
-    const int ghidraFunctionCount = ghidraObject.value(QStringLiteral("function_count")).toInt();
-    const int ghidraPointerOnlyCount =
-      ghidraObject.value(QStringLiteral("pointer_referenced_count")).toInt();
-    const int ghidraUnreferencedCount =
-      ghidraObject.value(QStringLiteral("unreferenced_count")).toInt();
-    const int truncatedSourceLists =
-      ghidraObject.value(QStringLiteral("truncated_source_lists")).toInt();
-    modeConflictCount = ghidraObject.value(QStringLiteral("mode_conflict_count")).toInt();
-    const double regionBytes = ghidraObject.value(QStringLiteral("region_bytes")).toDouble();
-    const double gradedBodyBytes = ghidraObject.value(QStringLiteral("graded_body_bytes")).toDouble();
-    const double ghidraCodeFraction = regionBytes > 0.0 ? gradedBodyBytes / regionBytes : 0.0;
-    const int referenceTypeTotal = [&] {
-      int total = 0;
-      const auto histogram =
-        ghidraObject.value(QStringLiteral("reference_type_histogram")).toObject();
-      for (const QString& key : histogram.keys()) total += histogram.value(key).toInt();
-      return total;
-    }();
-    const bool ghidraVerified =
-      ghidraSchema == 4 &&
-      observedEntry == expectedEntry &&
-      observedLanguage == QStringLiteral("ARM:LE:32:v4t") &&
-      observedEntryFunction == QStringLiteral("entry") &&
-      romBlockMatches && entryWordMatches && ghidraFunctionCount > 0;
-    const QJsonObject ghidraVerification{
-      { QStringLiteral("iteration"), iteration },
-      { QStringLiteral("status"), ghidraVerified ? QStringLiteral("CLEAN") : QStringLiteral("CONFLICT") },
-      { QStringLiteral("seeded_from_extents"), extentsPath },
-      { QStringLiteral("manifest"), QFileInfo(ghidraAnalysisPath).fileName() },
-      { QStringLiteral("manifest_schema"), ghidraSchema },
-      { QStringLiteral("expected_entry"), hex32(game.entryTarget) },
-      { QStringLiteral("observed_entry"), ghidraObject.value(QStringLiteral("entry")) },
-      { QStringLiteral("entry_function"), observedEntryFunction },
-      { QStringLiteral("language"), observedLanguage },
-      { QStringLiteral("rom_block_matches_cartridge"), romBlockMatches },
-      { QStringLiteral("expected_entry_word"), expectedWord },
-      { QStringLiteral("observed_entry_word"), observedWord },
-      { QStringLiteral("entry_word_matches_cartridge"), entryWordMatches },
-      { QStringLiteral("function_count"), ghidraFunctionCount },
-      { QStringLiteral("pointer_referenced_count"), ghidraPointerOnlyCount },
-      { QStringLiteral("unreferenced_count"), ghidraUnreferencedCount },
-      { QStringLiteral("truncated_source_lists"), truncatedSourceLists },
-      { QStringLiteral("region_bytes"), regionBytes },
-      { QStringLiteral("function_body_bytes"), gradedBodyBytes },
-      { QStringLiteral("function_body_fraction"), ghidraCodeFraction },
-      // Recorded because it is what shows the function list is mostly decoded
-      // data: on a 16 MB cartridge the COMPUTED_CALL bucket runs to six figures
-      // while COMPUTED_JUMP — Ghidra's real switch-table recovery — stays in the
-      // dozens. Seed admission ignores these classes and decodes the cited
-      // instruction itself; the histogram is here so the ratio stays visible.
-      { QStringLiteral("reference_type_histogram"),
-        ghidraObject.value(QStringLiteral("reference_type_histogram")) },
-      { QStringLiteral("reference_count"), referenceTypeTotal },
-      { QStringLiteral("function_list_role"),
-        QStringLiteral("seed source, not a coverage oracle: a raw cartridge has no "
-                       "section table, so Ghidra's function list includes data it "
-                       "decoded as code") },
-      { QStringLiteral("mode_conflict_count"), modeConflictCount },
-      { QStringLiteral("mode_conflicts"), ghidraObject.value(QStringLiteral("mode_conflicts")) },
-      { QStringLiteral("verification_source"),
-        QStringLiteral("Ghidra headless post-analysis manifest and raw cartridge bytes") },
-    };
-    ghidraPassRecords.append(ghidraVerification);
-    // Rewritten after every pass rather than once at the end, so a pass that
-    // fails verification still leaves behind the record of why.
-    if (!writeJson(QDir(proofDir).filePath(QStringLiteral("ghidra_verification.json")),
-                   QJsonObject{
-                     { QStringLiteral("schema"), 3 },
-                     { QStringLiteral("analysis_scope"),
-                       QStringLiteral("seeded from the extents gba_recompile proved "
-                                      "reachable on the same pass; disassembly starts "
-                                      "only inside them and is free to follow flow out "
-                                      "of them") },
-                     { QStringLiteral("verification_source"),
-                       QStringLiteral("Ghidra headless post-analysis manifest and raw "
-                                      "cartridge bytes") },
-                     { QStringLiteral("passes"), ghidraPassRecords },
-                   }, error)) {
-      fail(error);
-      return false;
-    }
-    if (!ghidraVerified) {
-      fail(QStringLiteral("Ghidra's pass %1 analysis does not match the selected cartridge; the build stopped without guessing.").arg(iteration));
-      return false;
-    }
-    emit logLine(QStringLiteral("Ghidra pass %1 verified entry %2 and its raw instruction word.")
-                   .arg(iteration).arg(hex32(game.entryTarget)));
-    emit logLine(QStringLiteral("Ghidra calls %1% of the cartridge code: %2 flow-referenced functions, %3 reachable only through a pointer word, %4 unreferenced. A cartridge has no section table, so this list is a seed source, not a coverage target.")
-                   .arg(ghidraCodeFraction * 100.0, 0, 'f', 1)
-                   .arg(ghidraFunctionCount).arg(ghidraPointerOnlyCount)
-                   .arg(ghidraUnreferencedCount));
-    if (truncatedSourceLists > 0) {
-      emit logLine(QStringLiteral("%1 function entries have more than %2 recorded references of one kind; the surplus is counted but not listed, so a seed that depends only on those is missed and self-heals loudly at runtime.")
-                     .arg(truncatedSourceLists)
-                     .arg(ghidraObject.value(QStringLiteral("max_recorded_sources")).toInt()));
-    }
-    if (modeConflictCount > 0) {
-      // Neither the TMode context register nor the entry alignment is
-      // trustworthy for these, so they are reported and left unseeded rather
-      // than guessed into ARM or THUMB. Seeding from the recompiler's extents
-      // pins TMode over every one of them, so a conflict now means Ghidra flowed
-      // somewhere the recompiler never went and disagreed with itself there.
-      emit logLine(QStringLiteral("%1 function entries have an ARM/THUMB mode that contradicts their alignment. They are recorded in ghidra_verification.json and deliberately not seeded:")
-                     .arg(modeConflictCount));
-      for (const auto& conflictValue : ghidraObject.value(QStringLiteral("mode_conflicts")).toArray()) {
-        const auto conflict = conflictValue.toObject();
-        emit logLine(QStringLiteral("  %1 %2 (recorded %3)")
-                       .arg(conflict.value(QStringLiteral("entry")).toString(),
-                            escapedComment(conflict.value(QStringLiteral("name")).toString()),
-                            conflict.value(QStringLiteral("tmode")).toString()));
-      }
-    }
-    return true;
-  };
-
-  // ── Recompiler ─────────────────────────────────────────────────────────
-  nextStage(QStringLiteral("Build the gbarecomp recompiler"));
-  const QString cacheRoot = QDir(QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation))
-                              .filePath(QStringLiteral("org.psxrecomp.studio"));
-  const QString recompilerBuild = QDir(cacheRoot).filePath(
-    hostTargetPlatform() == TargetPlatform::Windows
-      ? QStringLiteral("gbarecomp-build-vs2022-release")
-      : QStringLiteral("gbarecomp-build-ninja-release"));
-  QDir().mkpath(recompilerBuild);
-  QStringList recompilerConfigure{
-    QStringLiteral("-S"), gbarecompRoot, QStringLiteral("-B"), recompilerBuild
-  };
-  QStringList recompilerBuildArgs{
-    QStringLiteral("--build"), recompilerBuild,
-    QStringLiteral("--target"), QStringLiteral("gba_recompile"),
-    QStringLiteral("--parallel"), QString::number(std::max(1, QThread::idealThreadCount()))
-  };
-  if (hostTargetPlatform() == TargetPlatform::Windows) {
-    recompilerConfigure << QStringLiteral("-G") << QStringLiteral("Visual Studio 17 2022")
-                        << QStringLiteral("-A") << QStringLiteral("x64");
-    recompilerBuildArgs << QStringLiteral("--config") << QStringLiteral("Release");
-  } else {
-    recompilerConfigure << QStringLiteral("-G") << QStringLiteral("Ninja")
-                        << QStringLiteral("-DCMAKE_BUILD_TYPE=Release");
-  }
-  if (!runCommand(cmake, recompilerConfigure, request.frameworkRoot,
-                  QStringLiteral("cmake -S extra/gbarecomp -B <tool-cache>"),
-                  10 * 60 * 1000) ||
-      !runCommand(cmake, recompilerBuildArgs, request.frameworkRoot,
-                  QStringLiteral("cmake --build <tool-cache> --target gba_recompile"),
-                  45 * 60 * 1000)) {
-    if (cancellationRequested()) cancelledOut();
-    else fail(QStringLiteral("The gbarecomp static recompiler could not be built."));
-    return;
-  }
-  const QString executableSuffix = hostTargetPlatform() == TargetPlatform::Windows
-    ? QStringLiteral(".exe") : QString();
-  const QString recompileTool = QDir(hostTargetPlatform() == TargetPlatform::Windows
-      ? QDir(recompilerBuild).filePath(QStringLiteral("Release")) : recompilerBuild)
-    .filePath(QStringLiteral("gba_recompile") + executableSuffix);
-  if (!QFileInfo(recompileTool).isExecutable()) {
-    fail(QStringLiteral("The gbarecomp build completed without producing gba_recompile."));
-    return;
-  }
-
-  // ── BIOS ───────────────────────────────────────────────────────────────
-  // gbarecomp links src/runtime/generated_bios/bios_recompiled.cpp when it
-  // exists and a placeholder dispatch stub when it does not. The BIOS is never
-  // stubbed here: it is recompiled from the canonical image and dispatched.
-  nextStage(QStringLiteral("Recompile the GBA BIOS"));
-  const QString biosGeneratedDir = QDir(projectGbarecompDir)
-    .filePath(QStringLiteral("src/runtime/generated_bios"));
-  if (!QDir().mkpath(biosGeneratedDir)) {
-    fail(QStringLiteral("Could not create the recompiled BIOS output directory."));
-    return;
-  }
-  if (!runCommand(recompileTool,
-                  { QStringLiteral("--bios"), QDir(inputsDir).filePath(QStringLiteral("gba_bios.bin")),
-                    QStringLiteral("--config"), biosRecompilerConfig,
-                    QStringLiteral("--out"), biosGeneratedDir },
-                  projectDir,
-                  QStringLiteral("gba_recompile --bios gba_bios.bin --config bios/gba_bios.toml --out <generated_bios>"),
-                  45 * 60 * 1000)) {
-    if (cancellationRequested()) cancelledOut();
-    else fail(QStringLiteral("The GBA BIOS could not be recompiled."));
-    return;
-  }
-  for (const auto& produced : { QStringLiteral("bios_recompiled.cpp"),
-                                QStringLiteral("bios_dispatch_table.cpp") }) {
-    if (!QFileInfo(QDir(biosGeneratedDir).filePath(produced)).isFile()) {
-      fail(QStringLiteral("The BIOS recompilation did not produce %1; gbarecomp would fall back to its placeholder dispatch stub.")
-             .arg(produced));
-      return;
-    }
-  }
-  QHash<quint32, quint8> biosModesByAddress;
-  const int biosDispatchRows = readGbaDispatchEntries(
-    QDir(biosGeneratedDir).filePath(QStringLiteral("bios_dispatch_table.cpp")),
-    QStringLiteral("kBiosDispatchTableLen"), biosModesByAddress, error);
-  if (biosDispatchRows <= 0) {
-    fail(error.isEmpty()
-      ? QStringLiteral("The recompiled BIOS dispatch table is empty.") : error);
-    return;
-  }
-  emit logLine(QStringLiteral("Recompiled BIOS: %1 dispatch entries over %2 addresses, linked into gbarecomp_runtime.")
-                 .arg(biosDispatchRows).arg(biosModesByAddress.size()));
-
-  // ── Cartridge ──────────────────────────────────────────────────────────
-  // Pass 1 runs on the entry seed alone, so the recompiler's own recursive
-  // discovery is what establishes the first extent. Every pass then hands those
-  // extents to Ghidra, and admits the functions it reports whose evidence lands
-  // on an instruction the recompiler itself decoded. That grows the reachable
-  // set, which widens the extents, which is a new analysis — so the passes are
-  // iterated to a fixed point: the build converges when a pass admits nothing
-  // new, not when Ghidra's list is exhausted.
-  nextStage(QStringLiteral("Statically recompile the cartridge"));
-  QByteArray romBytes;
-  {
-    QFile romFile(romForAnalysis);
-    if (!romFile.open(QIODevice::ReadOnly)) {
-      fail(QStringLiteral("Could not reopen the cartridge to check pointer words: %1")
-             .arg(romFile.errorString()));
-      return;
-    }
-    romBytes = romFile.readAll();
-    if (romBytes.isEmpty()) {
-      fail(QStringLiteral("The cartridge image is empty."));
-      return;
-    }
-  }
-  const QString seedsPath = QDir(seedsDir).filePath(QStringLiteral("ghidra_funcs.tsv"));
-  const QString recompilerConfigPath =
-    QDir(recompilerDir).filePath(QStringLiteral("game.recomp.toml"));
-  const QString dispatchTablePath =
-    QDir(generatedDir).filePath(QStringLiteral("dispatch_table.cpp"));
-  QString seedText =
-    QStringLiteral("# Evidence-backed ARM/THUMB function entries for %1.\n"
-                   "# Format: 0xADDRESS<TAB>arm|thumb<TAB>name\n")
-      .arg(game.gameCode.isEmpty() ? request.windowTitle : game.gameCode);
-  seedText += QStringLiteral("0x%1\tarm\tentry\n")
-                .arg(game.entryTarget, 8, 16, QLatin1Char('0'));
-  if (!writeText(seedsPath, seedText, error)) {
-    fail(error);
-    return;
-  }
-  // Keyed by (address, instruction set): interworking makes one address
-  // legitimately reachable in both, and each needs its own seed row.
-  QSet<quint64> seeded{ static_cast<quint64>(game.entryTarget) << 1 };
-  QJsonArray iterationProof;
-  QJsonArray modeConflictsObserved;
-  QJsonArray interworkingSamples;
-  int dispatchRows = 0;
-  int dispatchAddresses = 0;
-  int translatedSpanCount = 0;
-  quint32 translatedBytes = 0;
-  // From the last pass's analysis, not a running total: each pass analyses a
-  // wider extent than the one before, so the final count is the one that
-  // describes the cartridge as it was finally seen.
-  int candidateCount = 0;
-  int admittedTotal = 0;
-  bool converged = false;
-  constexpr int kMaxGbaPasses = 8;
-  for (int iteration = 1; iteration <= kMaxGbaPasses; ++iteration) {
-    if (!runCommand(recompileTool,
-                    { QStringLiteral("--rom"), romForAnalysis,
-                      QStringLiteral("--config"), recompilerConfigPath,
-                      QStringLiteral("--symbols"), seedsPath,
-                      QStringLiteral("--rom-base"), hex32(kGbaRomBase),
-                      QStringLiteral("--out"), generatedDir },
-                    projectDir,
-                    QStringLiteral("gba_recompile --rom game.gba --config game.recomp.toml --symbols seeds/ghidra_funcs.tsv (pass %1)")
-                      .arg(iteration),
-                    90 * 60 * 1000)) {
-      if (cancellationRequested()) cancelledOut();
-      else fail(QStringLiteral("Static recompilation of the cartridge failed on pass %1.").arg(iteration));
-      return;
-    }
-    QHash<quint32, quint8> modesByAddress;
-    dispatchRows = readGbaDispatchEntries(
-      dispatchTablePath, QStringLiteral("kDispatchTableLen"), modesByAddress, error);
-    if (dispatchRows <= 0) {
-      fail(error.isEmpty()
-        ? QStringLiteral("The recompiled cartridge dispatch table is empty.") : error);
-      return;
-    }
-    dispatchAddresses = modesByAddress.size();
-    // What gbarecomp proved reachable this pass. Read alone first, with no
-    // instruction map, because this is what Ghidra is seeded with: the extents
-    // have to exist before there is anything for Ghidra to cite.
-    QList<GbaTranslatedSpan> spans;
-    GbaInstructionMap instructions;
-    if (!readGbaTranslation(generatedDir, nullptr, spans, instructions, error)) {
-      fail(error);
-      return;
-    }
-    translatedSpanCount = spans.size();
-    translatedBytes = gbaTranslatedBytes(spans);
-    const QString extentsPath = QDir(seedsDir).filePath(
-      QStringLiteral("translated_extents_pass%1.tsv").arg(iteration));
-    if (!writeText(extentsPath, gbaExtentsTable(spans), error)) {
-      fail(error);
-      return;
-    }
-    QJsonObject ghidraObject;
-    if (!analyzeWithGhidra(iteration, extentsPath, ghidraObject)) return;
-    // Every candidate Ghidra offers, strongest evidence first. The pointer-only
-    // tier is kept because a function-pointer table is how a GBA title reaches
-    // most of its code, and the seed rule below tests each candidate's evidence
-    // against gbarecomp's own translated extent rather than trusting the tier.
-    QJsonArray ghidraCandidates =
-      ghidraObject.value(QStringLiteral("functions")).toArray();
-    for (const auto& value :
-         ghidraObject.value(QStringLiteral("pointer_referenced_functions")).toArray()) {
-      ghidraCandidates.append(value);
-    }
-    QVector<GbaSeedCandidate> candidates;
-    candidates.reserve(ghidraCandidates.size());
-    for (const auto& candidateValue : ghidraCandidates) {
-      const auto function = candidateValue.toObject();
-      GbaSeedCandidate candidate;
-      bool ok = false;
-      candidate.entry = function.value(QStringLiteral("entry")).toString().toUInt(&ok, 16);
-      if (!ok) {
-        fail(QStringLiteral("Ghidra produced an invalid function address."));
-        return;
-      }
-      candidate.thumb =
-        function.value(QStringLiteral("mode")).toString() == QStringLiteral("thumb");
-      candidate.name = function.value(QStringLiteral("name")).toString();
-      candidate.directSources = readGbaSourceList(function, QStringLiteral("direct_sources"));
-      candidate.computedSources = readGbaSourceList(function, QStringLiteral("computed_sources"));
-      candidate.pointerSources = readGbaSourceList(function, QStringLiteral("pointer_sources"));
-      candidates.append(candidate);
-    }
-    candidateCount = candidates.size();
-    // Only an address Ghidra cites can ever be asked about, and a bl.lo is only
-    // admissible when its bl.hi two bytes earlier was decoded as well, so both
-    // are what the shard scan needs to retain out of a corpus that reaches
-    // hundreds of megabytes once the cartridge is well covered.
-    QSet<quint32> citedSources;
-    for (const auto& candidate : candidates) {
-      for (const auto* list : { &candidate.directSources, &candidate.computedSources,
-                                &candidate.pointerSources }) {
-        for (const quint32 source : *list) {
-          citedSources.insert(source);
-          citedSources.insert(source - 2);
-        }
-      }
-    }
-    // Now that there is something to look for, read the shards again for what
-    // gbarecomp decoded at each cited address. Every seed admitted below has to
-    // be backed by both this and the extents above.
-    if (!readGbaTranslation(generatedDir, &citedSources, spans, instructions, error)) {
-      fail(error);
-      return;
-    }
-
-    QList<QPair<GbaSeedCandidate, QString>> admitted;  // candidate, rule
-    QJsonArray admissionSamples;
-    QJsonArray rejectionSamples;
-    QHash<QString, int> admittedByRule;
-    int contradicted = 0;
-    int interworkingAdmissions = 0;
-    constexpr int kMaxRecordedSamples = 64;
-    for (const auto& candidate : candidates) {
-      const quint8 candidateMode = candidate.thumb ? kGbaModeThumb : kGbaModeArm;
-      const auto translated = modesByAddress.constFind(candidate.entry);
-      if (translated != modesByAddress.constEnd()) {
-        if ((translated.value() & candidateMode) != 0) continue;  // already covered
-        // Both tools translated this address, in different instruction sets.
-        // This is recorded rather than fatal: Ghidra loses these on a raw
-        // cartridge — it has been observed calling four bytes in the middle of
-        // a THUMB run an ARM function — and gbarecomp reached this address by
-        // following real control flow, so its mode is the better-evidenced one.
-        if (modeConflictsObserved.size() < kMaxRecordedSamples) {
-          modeConflictsObserved.append(QJsonObject{
-            { QStringLiteral("entry"), hex32(candidate.entry) },
-            { QStringLiteral("name"), candidate.name },
-            { QStringLiteral("ghidra_mode"),
-              candidate.thumb ? QStringLiteral("thumb") : QStringLiteral("arm") },
-            { QStringLiteral("gbarecomp_mode"), describeGbaModes(translated.value()) },
-            { QStringLiteral("iteration"), iteration },
-          });
-        }
-      }
-      const quint64 key =
-        (static_cast<quint64>(candidate.entry) << 1) | (candidate.thumb ? 1u : 0u);
-      if (seeded.contains(key)) continue;
-      QString rule;
-      QString reason;
-      quint32 evidence = 0;
-      bool modeCrossed = false;
-      if (!admitGbaSeed(candidate, spans, instructions, romBytes, kGbaRomBase,
-                        rule, evidence, modeCrossed, reason)) {
-        if (!reason.isEmpty()) {
-          ++contradicted;
-          if (rejectionSamples.size() < kMaxRecordedSamples) {
-            rejectionSamples.append(QJsonObject{
-              { QStringLiteral("entry"), hex32(candidate.entry) },
-              { QStringLiteral("name"), candidate.name },
-              { QStringLiteral("mode"),
-                candidate.thumb ? QStringLiteral("thumb") : QStringLiteral("arm") },
-              { QStringLiteral("rejected_because"), reason },
-              { QStringLiteral("iteration"), iteration },
-            });
-          }
-        }
-        continue;
-      }
-      admitted.append({ candidate, rule });
-      ++admittedByRule[rule];
-      if (modeCrossed) {
-        // A BX that changes instruction set. Real and expected — it is how a
-        // THUMB-compiled title enters an ARM veneer — but it is also the first
-        // thing to go wrong if a rule ever starts admitting decoded data, so
-        // each one is named rather than merely counted.
-        ++interworkingAdmissions;
-        if (interworkingSamples.size() < kMaxRecordedSamples) {
-          interworkingSamples.append(QJsonObject{
-            { QStringLiteral("entry"), hex32(candidate.entry) },
-            { QStringLiteral("entered_as"),
-              candidate.thumb ? QStringLiteral("thumb") : QStringLiteral("arm") },
-            { QStringLiteral("branch_site"), hex32(evidence) },
-            { QStringLiteral("iteration"), iteration },
-          });
-        }
-      }
-      if (admissionSamples.size() < kMaxRecordedSamples) {
-        admissionSamples.append(QJsonObject{
-          { QStringLiteral("entry"), hex32(candidate.entry) },
-          { QStringLiteral("name"), candidate.name },
-          { QStringLiteral("mode"),
-            candidate.thumb ? QStringLiteral("thumb") : QStringLiteral("arm") },
-          { QStringLiteral("rule"), rule },
-          { QStringLiteral("evidence_address"), hex32(evidence) },
-          { QStringLiteral("instruction"), instructions.value(evidence) },
-          { QStringLiteral("iteration"), iteration },
-        });
-      }
-    }
-    iterationProof.append(QJsonObject{
-      { QStringLiteral("iteration"), iteration },
-      { QStringLiteral("dispatch_entry_count"), dispatchRows },
-      { QStringLiteral("dispatch_address_count"), dispatchAddresses },
-      { QStringLiteral("translated_span_count"), translatedSpanCount },
-      { QStringLiteral("translated_bytes"), static_cast<double>(translatedBytes) },
-      // What this pass handed Ghidra and what Ghidra handed back. Both grow
-      // pass over pass; if the candidate count ever jumps by orders of
-      // magnitude, the analysis has escaped the extents into cartridge data.
-      { QStringLiteral("ghidra_seeded_from"), QFileInfo(extentsPath).fileName() },
-      { QStringLiteral("ghidra_candidate_count"), candidates.size() },
-      { QStringLiteral("ghidra_cited_source_count"), citedSources.size() },
-      { QStringLiteral("admitted_seed_count"), admitted.size() },
-      { QStringLiteral("admitted_by_direct_branch"),
-        admittedByRule.value(QStringLiteral("direct-branch")) },
-      { QStringLiteral("admitted_by_register_indirect"),
-        admittedByRule.value(QStringLiteral("register-indirect")) },
-      { QStringLiteral("admitted_by_pointer_word"),
-        admittedByRule.value(QStringLiteral("pointer-word")) },
-      { QStringLiteral("interworking_admission_count"), interworkingAdmissions },
-      { QStringLiteral("contradicted_candidate_count"), contradicted },
-      { QStringLiteral("admission_samples"), admissionSamples },
-      { QStringLiteral("rejection_samples"), rejectionSamples },
-      { QStringLiteral("max_recorded_samples"), kMaxRecordedSamples },
-    });
-    emit logLine(QStringLiteral("Pass %1: %2 dispatch entries over %3 addresses, %4 bytes translated in %5 extents; %6 new Ghidra seeds admitted (%7 direct branch, %8 register-indirect, %9 pointer word), %10 rejected on decoded evidence.")
-                   .arg(iteration).arg(dispatchRows).arg(dispatchAddresses)
-                   .arg(translatedBytes).arg(translatedSpanCount).arg(admitted.size())
-                   .arg(admittedByRule.value(QStringLiteral("direct-branch")))
-                   .arg(admittedByRule.value(QStringLiteral("register-indirect")))
-                   .arg(admittedByRule.value(QStringLiteral("pointer-word")))
-                   .arg(contradicted));
-    if (admitted.isEmpty()) {
-      // Fixed point: this pass found no address that Ghidra can prove is code
-      // and gbarecomp has not already translated. Anything still missing is
-      // reached only through a computed target neither tool resolved; the
-      // runtime bridges those through the reference interpreter, counts them,
-      // and reports them in its coverage banner.
-      converged = true;
-      break;
-    }
-    QFile seedFile(seedsPath);
-    if (!seedFile.open(QIODevice::Append | QIODevice::Text)) {
-      fail(QStringLiteral("Could not extend the Ghidra seed manifest."));
-      return;
-    }
-    seedFile.write(QStringLiteral("# pass %1: %2 entries admitted on evidence inside translated code\n")
-                     .arg(iteration).arg(admitted.size()).toUtf8());
-    for (const auto& entry : admitted) {
-      const GbaSeedCandidate& candidate = entry.first;
-      seedFile.write(QStringLiteral("0x%1\t%2\t%3\n")
-                       .arg(candidate.entry, 8, 16, QLatin1Char('0'))
-                       .arg(candidate.thumb ? QStringLiteral("thumb") : QStringLiteral("arm"),
-                            escapedComment(candidate.name))
-                       .toUtf8());
-      seeded.insert((static_cast<quint64>(candidate.entry) << 1) |
-                    (candidate.thumb ? 1u : 0u));
-    }
-    seedFile.close();
-    admittedTotal += admitted.size();
-  }
-  if (!converged) {
-    fail(QStringLiteral("Seed admission did not reach a fixed point in %1 recompilation passes; the last pass was still finding new evidence, so the translation is incomplete in a way the build cannot characterise.")
-           .arg(kMaxGbaPasses));
-    return;
-  }
-  const QJsonObject coverageProof{
-    { QStringLiteral("schema"), 4 },
-    { QStringLiteral("status"), QStringLiteral("CONVERGED") },
-    { QStringLiteral("criterion"),
-      QStringLiteral("fixed point: a pass admitted no Ghidra function reachable "
-                     "by a control transfer gbarecomp itself decoded inside "
-                     "code it had already translated") },
-    { QStringLiteral("analysis_order"),
-      QStringLiteral("gbarecomp runs first, from the entry point alone. Each "
-                     "pass writes the extents its recursive descent proved "
-                     "reachable and Ghidra is re-analysed from those, so "
-                     "disassembly starts only at instructions the recompiler "
-                     "decoded. It stays free to follow flow out of them — "
-                     "resolving targets gbarecomp could not is the only reason "
-                     "it runs — but it can no longer start inside cartridge "
-                     "art. Per-pass manifests are ghidra_analysis_pass<N>.json "
-                     "and their verification is ghidra_verification.json.") },
-    { QStringLiteral("why_not_full_ghidra_coverage"),
-      QStringLiteral("a raw cartridge has no section table, so Ghidra "
-                     "disassembles compressed art and sample data as code and "
-                     "its function list is a seed source, not a coverage "
-                     "target") },
-    { QStringLiteral("why_ghidra_reference_class_is_not_trusted"),
-      QStringLiteral("Ghidra's reference classes come from that same decoding. "
-                     "It renders a THUMB BL second halfword with no first "
-                     "halfword in front of it as a call through LR and "
-                     "propagates a destination into it, which manufactures a "
-                     "COMPUTED_CALL out of data. Every rule below therefore "
-                     "asks gbarecomp what the cited address contains and "
-                     "ignores how Ghidra classified the reference.") },
-    { QStringLiteral("seed_rules"), QJsonArray{
-        QStringLiteral("direct-branch: gbarecomp decoded a B/Bcc or a complete "
-                       "BL pair at the cited address and its resolved "
-                       "destination is this entry; the site's instruction set "
-                       "must match, because ARMv4T has no BLX and a direct "
-                       "branch therefore cannot switch mode"),
-        QStringLiteral("register-indirect: gbarecomp decoded a BX or other PC "
-                       "write at the cited address, so control provably leaves "
-                       "there and it could not resolve where; no mode "
-                       "constraint applies, because a BX carries the "
-                       "destination instruction set in bit 0"),
-        QStringLiteral("pointer-word: a data reference from a word inside a "
-                       "translated extent whose stored value is exactly entry|1 for "
-                       "THUMB or entry for ARM, since bit 0 of a BX target selects "
-                       "the instruction set"),
-      } },
-    { QStringLiteral("rejected_evidence"), QJsonArray{
-        QStringLiteral("a cited address that is not an instruction boundary in "
-                       "gbarecomp's translation, however far inside a "
-                       "translated extent it falls"),
-        QStringLiteral("an orphan bl.lo — a BL second halfword whose first "
-                       "halfword was never decoded — because a branch whose "
-                       "target is unresolved is not evidence about where "
-                       "control goes"),
-        QStringLiteral("a direct branch whose resolved destination is some "
-                       "address other than the candidate entry"),
-      } },
-    { QStringLiteral("interworking_admissions"), interworkingSamples },
-    { QStringLiteral("ghidra_candidate_count"), candidateCount },
-    { QStringLiteral("admitted_seed_count"), admittedTotal },
-    { QStringLiteral("dispatch_entry_count"), dispatchRows },
-    { QStringLiteral("dispatch_address_count"), dispatchAddresses },
-    { QStringLiteral("translated_span_count"), translatedSpanCount },
-    { QStringLiteral("translated_bytes"), static_cast<double>(translatedBytes) },
-    { QStringLiteral("cartridge_bytes"), static_cast<double>(romBytes.size()) },
-    { QStringLiteral("bios_dispatch_entry_count"), biosDispatchRows },
-    { QStringLiteral("unseeded_mode_conflicts"), modeConflictCount },
-    { QStringLiteral("gbarecomp_mode_conflicts"), modeConflictsObserved },
-    { QStringLiteral("residual_gap_handling"),
-      QStringLiteral("a dispatch miss at runtime bridges through gbarecomp's "
-                     "reference interpreter, is counted in the coverage banner, "
-                     "and is emitted as a reviewable game.toml proposal — it is "
-                     "never silently absorbed") },
-    { QStringLiteral("iterations"), iterationProof },
-  };
-  if (!writeJson(QDir(proofDir).filePath(QStringLiteral("ghidra_coverage_proof.json")),
-                 coverageProof, error)) {
-    fail(error);
-    return;
-  }
-  emit logLine(QStringLiteral("Seed admission converged: %1 seeds admitted on evidence inside translated code, out of the %2 candidates the final analysis offered. Dispatch table holds %3 entries over %4 addresses, translating %5 of the cartridge's %6 bytes.")
-                 .arg(admittedTotal).arg(candidateCount).arg(dispatchRows)
-                 .arg(dispatchAddresses).arg(translatedBytes).arg(romBytes.size()));
-  if (!modeConflictsObserved.isEmpty()) {
-    emit logLine(QStringLiteral("%1 address(es) were translated by both tools in different instruction sets. gbarecomp reached them by following real control flow, so its decoding stands; each one is recorded in ghidra_coverage_proof.json.")
-                   .arg(modeConflictsObserved.size()));
-  }
-
-  nextStage(QStringLiteral("Finalize gbarecomp CMake repository"));
-  const QString readmeLayout = virtuaTarget
-    ? QStringLiteral(
-        "- `generated/` — the translated cartridge (`recompiled_*.cpp`, "
-        "`dispatch_table.cpp`), compiled for Cortex-A7 and linked into the "
-        "`.virtua` image.\n"
-        "- `gbarecomp/` — the emulation core. `framework/extra/gba-to-mvii` "
-        "compiles a curated subset of it (no window, no audio device, no "
-        "overlay recompiler — none of those exist on MVII) plus the recompiled "
-        "BIOS in `gbarecomp/src/runtime/generated_bios/`.\n"
-        "- `framework/extra/gba-to-mvii/` — the MVII runtime: `/dev/fb0`, "
-        "`/dev/input0`, `/dev/dac0` and the cooperative yield.\n"
-        "- `framework/extra/virtua/` — the CMake that resolves PowerEngine. "
-        "Nothing from PowerEngine is vendored here; the toolchain, sysroot, "
-        "R-Dash, linker script and packager all come out of "
-        "`POWERENGINE_ROOT`.\n"
-        "- `recompiler/` — the `gba_recompile` configuration and the Ghidra "
-        "seed table it was driven with.\n"
-        "- `resources/game.toml` — the export's record of cartridge identity "
-        "and save configuration. The MVII image does not read it: it resolves "
-        "`game.gba` and `gba_bios.bin` beside its own executable.\n"
-        "- `proof/` — Ghidra verification and the static-coverage proof.\n")
-    : QStringLiteral(
-        "- `generated/` — the translated cartridge (`recompiled_*.cpp`, "
-        "`dispatch_table.cpp`).\n"
-        "- `gbarecomp/src/runtime/generated_bios/` — the recompiled BIOS, "
-        "linked into `gbarecomp_runtime`.\n"
-        "- `recompiler/` — the `gba_recompile` configuration and the Ghidra "
-        "seed table it was driven with.\n"
-        "- `proof/` — Ghidra verification and the static-coverage proof.\n");
-  const QString readmeBuild = virtuaTarget
-    ? QStringLiteral(
-        "## Build\n\nThe guest is ARMv4T and the device is ARMv7-A, so the "
-        "translation is compiled, not interpreted — but it is compiled by "
-        "PowerEngine's toolchain, not the host's:\n\n"
-        "```sh\ncmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \\\n"
-        "  -DCMAKE_TOOLCHAIN_FILE=framework/extra/virtua/CMake/VirtuaArmToolchain.cmake \\\n"
-        "  -DPOWERENGINE_ROOT=/path/to/PowerEngine \\\n"
-        "  -DVIRTUA_LLVM_ROOT=/path/to/PowerEngine/compiler-bundle\n"
-        "cmake --build build --target gba-runtime --parallel\n```\n\n"
-        "The package is emitted under "
-        "`build/steganos-package/gba-runtime/Release/`: the `.virtua` image "
-        "with `game.gba` and `gba_bios.bin` beside it.\n")
-    : QStringLiteral(
-        "## Build\n\n```sh\ncmake -S . -B build -DCMAKE_BUILD_TYPE=Release\n"
-        "cmake --build build --target gba-runtime --parallel\n```\n\n"
-        "The package is emitted under "
-        "`build/steganos-package/gba-runtime/<configuration>/`.\n");
-  const QString readme = QStringLiteral(
-    "# %1 — gbarecomp Studio source export\n\n"
-    "Generated by PSXRecomp Studio for **%2**. The cartridge and the GBA BIOS "
-    "were statically recompiled to C++ during export by `gba_recompile`, seeded "
-    "from a verified headless Ghidra analysis. This project compiles that "
-    "translation; it never recompiles at build time and never needs the ROM to "
-    "build.\n\n%3\n%4")
-      .arg(request.windowTitle, targetPlatformDisplayName(request.targetPlatform),
-           readmeLayout, readmeBuild);
-  if (!writeText(QDir(projectDir).filePath(QStringLiteral("CMakeLists.txt")),
-                 generatedGbaProjectCMake(request, game, bundleName, bundleId), error) ||
-      !writeText(QDir(projectDir).filePath(QStringLiteral("README.md")), readme, error) ||
-      !createProofArchive(proofDir, QDir(projectDir).filePath(QStringLiteral("PSXRecomp-Proof.zip")), error)) {
-    fail(error);
-    return;
-  }
-
-  QByteArray commitOutput;
-  if (!runCommand(git, { QStringLiteral("init"), QStringLiteral("--initial-branch=main") },
-                  projectDir, QStringLiteral("git init --initial-branch=main"), 60000) ||
-      !runCommand(git, { QStringLiteral("config"), QStringLiteral("user.name"),
-                         QStringLiteral("PSXRecomp Studio") }, projectDir,
-                  QStringLiteral("git config user.name <studio>"), 30000) ||
-      !runCommand(git, { QStringLiteral("config"), QStringLiteral("user.email"),
-                         QStringLiteral("studio@psxrecomp.local") }, projectDir,
-                  QStringLiteral("git config user.email <studio>"), 30000) ||
-      !runCommand(git, { QStringLiteral("add"), QStringLiteral("-A") }, projectDir,
-                  QStringLiteral("git add -A"), 2 * 60 * 60 * 1000) ||
-      !runCommand(git, { QStringLiteral("commit"), QStringLiteral("-m"),
-                         QStringLiteral("Generate %1 %2 gbarecomp source")
-                           .arg(request.windowTitle,
-                                targetPlatformDisplayName(request.targetPlatform)) },
-                  projectDir, QStringLiteral("git commit -m <generated gbarecomp source>"),
-                  2 * 60 * 60 * 1000) ||
-      !runCommand(git, { QStringLiteral("rev-parse"), QStringLiteral("HEAD") },
-                  projectDir, QStringLiteral("git rev-parse HEAD"), 30000,
-                  &commitOutput)) {
-    if (cancellationRequested()) cancelledOut();
-    else fail(QStringLiteral("The generated gbarecomp source repository could not be committed."));
-    return;
-  }
-  const QString sourceCommit = QString::fromUtf8(commitOutput).trimmed().section('\n', -1);
-  emit logLine(QStringLiteral("Generated gbarecomp source commit: %1").arg(sourceCommit));
-
-  auto removeEntry = [](const QString& path) {
-    const QFileInfo info(path);
-    if (!info.exists() && !info.isSymLink()) return true;
-    return info.isDir() && !info.isSymLink() ? QDir(path).removeRecursively()
-                                             : QFile::remove(path);
-  };
-  auto publishZip = [&](const QString& source, const QString& rootName,
-                        const QString& output) -> bool {
-    const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    const QString staging = output + QStringLiteral(".psxrecomp-new-") + token;
-    const QString backup = output + QStringLiteral(".psxrecomp-old-") + token;
-    removeEntry(staging); removeEntry(backup);
-    if (!createPackageArchive(source, rootName, staging, error, {},
-                              [this]() { return cancellationRequested(); })) {
-      removeEntry(staging); return false;
-    }
-    const QString stagedHash = sha256File(staging, error);
-    if (stagedHash.isEmpty()) { removeEntry(staging); return false; }
-    const bool exists = QFileInfo::exists(output) || QFileInfo(output).isSymLink();
-    if (exists && !request.overwriteOutput) {
-      error = QStringLiteral("The output already exists and overwrite was not approved: %1").arg(output);
-      removeEntry(staging); return false;
-    }
-    if (exists && !QFile::rename(output, backup)) {
-      error = QStringLiteral("Could not preserve the previous output: %1").arg(output);
-      removeEntry(staging); return false;
-    }
-    if (!QFile::rename(staging, output)) {
-      if (exists) QFile::rename(backup, output);
-      error = QStringLiteral("Could not publish %1.").arg(output);
-      return false;
-    }
-    if (exists) removeEntry(backup);
-    return sha256File(output, error) == stagedHash;
-  };
-  auto publishDirectory = [&](const QString& source, const QString& output) -> bool {
-    const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    const QString staging = output + QStringLiteral(".psxrecomp-new-") + token;
-    const QString backup = output + QStringLiteral(".psxrecomp-old-") + token;
-    removeEntry(staging); removeEntry(backup);
-    if (!copyDirectoryTree(source, staging, error)) return false;
-    const bool exists = QFileInfo::exists(output) || QFileInfo(output).isSymLink();
-    if (exists && !request.overwriteOutput) {
-      error = QStringLiteral("The output already exists and overwrite was not approved: %1").arg(output);
-      removeEntry(staging); return false;
-    }
-    if (exists && !QDir().rename(output, backup)) {
-      error = QStringLiteral("Could not preserve the previous output: %1").arg(output);
-      removeEntry(staging); return false;
-    }
-    if (!QDir().rename(staging, output)) {
-      if (exists) QDir().rename(backup, output);
-      error = QStringLiteral("Could not publish %1.").arg(output);
-      return false;
-    }
-    if (exists) removeEntry(backup);
-    return true;
-  };
-
-  if (sourceExport) {
-    nextStage(QStringLiteral("Deliver gbarecomp source repository"));
-    const QString output = QDir(request.outputDirectory).filePath(exportOutputName(request));
-    const bool ok = request.exportAsZip
-      ? publishZip(projectDir, QFileInfo(output).completeBaseName(), output)
-      : publishDirectory(projectDir, output);
-    if (!ok) {
-      if (cancellationRequested()) cancelledOut(); else fail(error);
-      return;
-    }
-    QDir(workspace).removeRecursively();
-    emit completed(output);
-    return;
-  }
-
-  if (remoteCiBuild) {
-    nextStage(QStringLiteral("Stage gbarecomp source for CI"));
-    const QString ciRoot =
-      QDir(QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation))
-        .filePath(QStringLiteral("org.psxrecomp.studio/psxrecomp-ci-sources"));
-    if (!QDir().mkpath(ciRoot)) {
-      fail(QStringLiteral("Could not create the CI source cache."));
-      return;
-    }
-    const QString ciRepository = QDir(ciRoot).filePath(
-      QStringLiteral("%1-gbarecomp-%2-%3")
-        .arg(sanitizedFileStem(request.windowTitle),
-             targetPlatformKey(request.targetPlatform),
-             QUuid::createUuid().toString(QUuid::WithoutBraces)));
-    if (!QDir().rename(projectDir, ciRepository) &&
-        (!copyDirectoryTree(projectDir, ciRepository, error) ||
-         !QDir(projectDir).removeRecursively())) {
-      fail(error.isEmpty() ? QStringLiteral("Could not stage the gbarecomp source repository for CI.") : error);
-      return;
-    }
-    QDir(workspace).removeRecursively();
-    emit ciSourcePrepared(request, ciRepository, sourceCommit);
-    return;
-  }
-
-  nextStage(virtuaTarget
-    ? QStringLiteral("Cross-compile gbarecomp package for Virtua ARM")
-    : QStringLiteral("Build gbarecomp package through CMake"));
-  QStringList configure{ QStringLiteral("-S"), projectDir, QStringLiteral("-B"), buildDir };
-  if (virtuaTarget) {
-    // Ninja whatever the host is: this is a freestanding ARM cross-compile
-    // driven by PowerEngine's clang, which the Visual Studio generator cannot
-    // express. POWERENGINE_ROOT and VIRTUA_LLVM_ROOT are passed, never copied —
-    // the sysroot, R-Dash, the linker script and the packager stay where they
-    // are installed.
-    configure << QStringLiteral("-G") << QStringLiteral("Ninja")
-              << QStringLiteral("-DCMAKE_BUILD_TYPE=Release")
-              << QStringLiteral("-DCMAKE_TOOLCHAIN_FILE=%1")
-                   .arg(QDir(projectDir).filePath(QStringLiteral(
-                     "framework/extra/virtua/CMake/VirtuaArmToolchain.cmake")))
-              << QStringLiteral("-DPOWERENGINE_ROOT=%1").arg(request.powerEngineRoot)
-              << QStringLiteral("-DVIRTUA_LLVM_ROOT=%1").arg(request.llvmRoot);
-  } else if (hostTargetPlatform() == TargetPlatform::Windows) {
-    configure << QStringLiteral("-G") << QStringLiteral("Visual Studio 17 2022")
-              << QStringLiteral("-A") << QStringLiteral("x64");
-  } else {
-    configure << QStringLiteral("-G") << QStringLiteral("Ninja")
-              << QStringLiteral("-DCMAKE_BUILD_TYPE=Release");
-  }
-  QStringList build{ QStringLiteral("--build"), buildDir, QStringLiteral("--target"),
-                     QStringLiteral("gba-runtime"), QStringLiteral("--parallel"),
-                     QString::number(std::max(1, QThread::idealThreadCount())) };
-  if (!virtuaTarget && hostTargetPlatform() == TargetPlatform::Windows)
-    build << QStringLiteral("--config") << QStringLiteral("Release");
-  if (!runCommand(cmake, configure, workspace,
-                  QStringLiteral("cmake -S <gbarecomp project> -B <build>"), 10 * 60 * 1000) ||
-      !runCommand(cmake, build, workspace,
-                  QStringLiteral("cmake --build <build> --target gba-runtime"),
-                  4 * 60 * 60 * 1000)) {
-    if (cancellationRequested()) cancelledOut();
-    else fail(QStringLiteral("The %1 gbarecomp package could not be built and staged.")
-                .arg(targetPlatformDisplayName(request.targetPlatform)));
-    return;
-  }
-  const QString builtPackage = QDir(buildDir).filePath(
-    QStringLiteral("steganos-package/gba-runtime/Release"));
-  QDir(stageDir).removeRecursively();
-  if (!copyDirectoryTree(builtPackage, stageDir, error)) {
-    fail(error.isEmpty() ? QStringLiteral("The built gbarecomp package could not be staged.") : error);
-    return;
-  }
-
-  const QString stagedApp = macosTarget
-    ? QDir(stageDir).filePath(bundleName + QStringLiteral(".app")) : stageDir;
-  const QString executableExtension = windowsTarget ? QStringLiteral(".exe")
-    : virtuaTarget ? QStringLiteral(".virtua") : QString();
-  const QString mainExecutable = macosTarget
-    ? QDir(stagedApp).filePath(QStringLiteral("Contents/MacOS/") + bundleName)
-    : QDir(stageDir).filePath(bundleName + executableExtension);
-  // game.toml resolves [rom].path and [bios].path against its own directory, so
-  // the runtime reads them from exactly these locations. The MVII image has no
-  // config file at all: it resolves both assets as dirname(argv[0])/<name>, so
-  // its package is the three files side by side.
-  const QString packagedResources = macosTarget
-    ? QDir(stagedApp).filePath(QStringLiteral("Contents/Resources")) : stageDir;
-  const QString packagedConfig = virtuaTarget
-    ? QString() : QDir(packagedResources).filePath(QStringLiteral("game.toml"));
-  const QString packagedRom = QDir(packagedResources).filePath(
-    virtuaTarget ? QStringLiteral("game.gba") : QStringLiteral("game/game.gba"));
-  const QString packagedBios = QDir(packagedResources).filePath(
-    virtuaTarget ? QStringLiteral("gba_bios.bin") : QStringLiteral("bios/gba_bios.bin"));
-  if (!QFileInfo(mainExecutable).isFile() ||
-      (!virtuaTarget && !QFileInfo(packagedConfig).isFile())) {
-    fail(virtuaTarget
-      ? QStringLiteral("The Virtua ARM gbarecomp package is missing its .virtua image.")
-      : QStringLiteral("The gbarecomp package is missing its executable or game.toml."));
-    return;
-  }
-  if (sha256File(packagedRom, error) != romSha256 ||
-      sha256File(packagedBios, error) != biosSha256) {
-    fail(error.isEmpty()
-      ? QStringLiteral("The packaged GBA ROM or BIOS resource does not match the selected input.")
-      : error);
-    return;
-  }
-
-  nextStage(QStringLiteral("Verify gbarecomp package"));
-  if (macosTarget) {
-    const QString inspection = createMacosInspectionAlias(
-      mainExecutable, QDir(workspace).filePath(QStringLiteral("macos-inspection")), error);
-    if (inspection.isEmpty()) { fail(error); return; }
-    QByteArray deps;
-    if (!runCommand(QStringLiteral("/usr/bin/otool"), { QStringLiteral("-L"), inspection },
-                    workspace, QStringLiteral("otool -L <gbarecomp executable>"), 30000, &deps)) {
-      fail(QStringLiteral("The gbarecomp executable dependencies could not be inspected."));
-      return;
-    }
-    if (QString::fromUtf8(deps).contains(QStringLiteral("libusb"), Qt::CaseInsensitive)) {
-      fail(QStringLiteral("The gbarecomp app links libusb dynamically; the shared GIP backend must be static."));
-      return;
-    }
-    if (request.macosGipGamepad) {
-      QByteArray symbols;
-      if (!runCommand(QStringLiteral("/usr/bin/nm"),
-                      { QStringLiteral("-gU"), inspection }, workspace,
-                      QStringLiteral("nm -gU <gbarecomp executable>"), 30000, &symbols) ||
-          !nmOutputHasMacosGipBackend(symbols)) {
-        fail(QStringLiteral("The gbarecomp executable does not contain the shared macOS GIP backend."));
-        return;
-      }
-    }
-  }
-  // The recompiled cartridge is compiled into this executable, so the dispatch
-  // table's own symbol is the packaged proof that the translation was linked
-  // rather than dropped by the linker.
-  if (virtuaTarget) {
-    // A .virtua is the packager's own container, not an ELF, so the symbol
-    // question is asked of the ELF it was made from. The compiler bundle ships
-    // no llvm-nm and macOS nm cannot read ELF at all, hence elfinfo.py.
-    const QString linkedElf = QDir(buildDir).filePath(
-      QStringLiteral("gba-to-mvii/%1.elf").arg(bundleName));
-    if (!QFileInfo(linkedElf).isFile()) {
-      fail(QStringLiteral("The Virtua ARM link did not produce %1, so the package cannot be verified.")
-             .arg(linkedElf));
-      return;
-    }
-    const QString projectElfInfo = QDir(projectDir).filePath(
-      QStringLiteral("framework/extra/virtua/tools/elfinfo.py"));
-    QByteArray attributes;
-    if (!runCommand(python, { projectElfInfo, QStringLiteral("armattrs"), linkedElf },
-                    workspace, QStringLiteral("elfinfo.py armattrs <gba-to-mvii ELF>"),
-                    5 * 60 * 1000, &attributes)) {
-      fail(QStringLiteral("The Virtua ARM ELF has no readable .ARM.attributes section."));
-      return;
-    }
-    const QString attributeText = QString::fromUtf8(attributes);
-    // Tag_CPU_arch 10 is ARMv7 and Tag_CPU_arch_profile 65 is 'A'. A guest built
-    // for anything else would load and then fault on the first instruction the
-    // Cortex-A7 does not have.
-    if (!attributeText.contains(QStringLiteral("Tag_CPU_arch = 10")) ||
-        !attributeText.contains(QStringLiteral("Tag_CPU_arch_profile = 65"))) {
-      fail(QStringLiteral("The linked image is not tagged ARMv7-A:\n%1").arg(attributeText));
-      return;
-    }
-    // Nothing may be left undefined: the image is statically linked and there is
-    // no dynamic loader on MVII to resolve a straggler at run time.
-    QByteArray undefined;
-    if (!runCommand(python, { projectElfInfo, QStringLiteral("undef"), linkedElf },
-                    workspace, QStringLiteral("elfinfo.py undef <gba-to-mvii ELF>"),
-                    5 * 60 * 1000, &undefined)) {
-      fail(QStringLiteral("The Virtua ARM image has undefined symbols, which MVII has no loader to resolve:\n%1")
-             .arg(QString::fromUtf8(undefined)));
-      return;
-    }
-    QByteArray dispatchSymbol;
-    if (!runCommand(python,
-                    { projectElfInfo, QStringLiteral("symbols"), linkedElf,
-                      QStringLiteral("kDispatchTable") },
-                    workspace, QStringLiteral("elfinfo.py symbols <gba-to-mvii ELF> kDispatchTable"),
-                    5 * 60 * 1000, &dispatchSymbol)) {
-      fail(QStringLiteral("The linked Virtua ARM image does not contain the recompiled cartridge dispatch table."));
-      return;
-    }
-    // And the packaged container itself: a v3 image, ARM32, cooperatively
-    // scheduled. A preemptive image would be descheduled mid-frame by a kernel
-    // that expects the guest to yield.
-    QFile container(mainExecutable);
-    if (!container.open(QIODevice::ReadOnly)) {
-      fail(QStringLiteral("The staged .virtua image could not be read."));
-      return;
-    }
-    const QByteArray header = container.read(56);
-    container.close();
-    if (header.size() != 56 ||
-        qFromLittleEndian<quint32>(header.constData()) != 0x56495254u ||
-        qFromLittleEndian<quint32>(header.constData() + 4) != 3u) {
-      fail(QStringLiteral("The staged executable is not a Virtua v3 image."));
-      return;
-    }
-    const quint64 containerFlags = qFromLittleEndian<quint64>(header.constData() + 48);
-    if (((containerFlags >> 8u) & 0xffu) != 4u ||
-        (containerFlags & (1u << 1u)) == 0u) {
-      fail(QStringLiteral("The staged .virtua image is not a cooperative ARM32 executable (flags 0x%1).")
-             .arg(containerFlags, 16, 16, QLatin1Char('0')));
-      return;
-    }
-  } else {
-    QByteArray symbols;
-    const QString nm = hostTargetPlatform() == TargetPlatform::Windows
-      ? findExecutable(QStringLiteral("dumpbin")) : findExecutable(QStringLiteral("nm"));
-    if (nm.isEmpty()) {
-      fail(QStringLiteral("A symbol reader (nm, or dumpbin on Windows) is required to verify that the recompiled cartridge was linked."));
-      return;
-    }
-    const QStringList symbolArgs = hostTargetPlatform() == TargetPlatform::Windows
-      ? QStringList{ QStringLiteral("/SYMBOLS"), mainExecutable }
-      : QStringList{ QStringLiteral("-a"), mainExecutable };
-    if (!runCommand(nm, symbolArgs, workspace,
-                    QStringLiteral("%1 <gbarecomp executable>").arg(QFileInfo(nm).fileName()),
-                    5 * 60 * 1000, &symbols)) {
-      fail(QStringLiteral("The gbarecomp executable symbols could not be read."));
-      return;
-    }
-    if (!QString::fromUtf8(symbols).contains(QStringLiteral("kDispatchTable"))) {
-      fail(QStringLiteral("The packaged executable does not contain the recompiled cartridge dispatch table."));
-      return;
-    }
-  }
-  emit logLine(virtuaTarget
-    ? QStringLiteral("Verified: a cooperative ARMv7-A Virtua image, nothing undefined, carrying the recompiled cartridge dispatch table.")
-    : QStringLiteral("Verified: the packaged executable carries the recompiled cartridge dispatch table."));
-
-  nextStage(signingRequested ? QStringLiteral("Sign gbarecomp app")
-                             : QStringLiteral("Seal gbarecomp package"));
-  const QString preSignExecutableHash = sha256File(mainExecutable, error);
-  const QJsonObject buildProof{
-    { QStringLiteral("schema"), 3 },
-    { QStringLiteral("platform"), targetPlatformDisplayName(request.targetPlatform) },
-    { QStringLiteral("runtime"), QStringLiteral("gbarecomp") },
-    { QStringLiteral("execution"), QStringLiteral("static-recompilation") },
-    { QStringLiteral("executable"), QFileInfo(mainExecutable).fileName() },
-    { QStringLiteral("target_architecture"), virtuaTarget
-        ? QStringLiteral("armv7a-none-eabi (Cortex-A7)")
-        : QSysInfo::currentCpuArchitecture() },
-    // The guest is ARMv4T and the MVII device is ARMv7-A: two different
-    // instruction sets, so this is the same static recompilation the desktop
-    // packages get, compiled by PowerEngine's toolchain instead of the host's.
-    { QStringLiteral("host_runtime"), virtuaTarget
-        ? QStringLiteral("gba-to-mvii on MVII devices (/dev/fb0, /dev/input0, /dev/dac0)")
-        : QStringLiteral("gbarecomp desktop host runtime (SDL2)") },
-    { QStringLiteral("cartridge_dispatch_entries"), dispatchRows },
-    { QStringLiteral("cartridge_dispatch_addresses"), dispatchAddresses },
-    { QStringLiteral("bios_dispatch_entries"), biosDispatchRows },
-    { QStringLiteral("ghidra_candidate_count"), candidateCount },
-    { QStringLiteral("ghidra_seeds_admitted"), admittedTotal },
-    { QStringLiteral("translated_cartridge_bytes"), static_cast<double>(translatedBytes) },
-    { QStringLiteral("pre_sign_executable_sha256"), preSignExecutableHash },
-    { QStringLiteral("macos_gip_compiled"), macosTarget && request.macosGipGamepad },
-    { QStringLiteral("scanlines_optional"), true },
-    { QStringLiteral("scanlines_default"), false },
-    { QStringLiteral("menu"), true },
-    { QStringLiteral("package_contains_rom_or_bios"), true },
-    { QStringLiteral("signing_mode"), signingRequested ? QStringLiteral("pfx")
-        : macosTarget ? QStringLiteral("ad-hoc") : QStringLiteral("none") },
-  };
-  if (preSignExecutableHash.isEmpty() ||
-      !writeJson(QDir(proofDir).filePath(QStringLiteral("gba_build.json")), buildProof, error) ||
-      !createProofArchive(proofDir, QDir(projectDir).filePath(QStringLiteral("PSXRecomp-Proof.zip")), error) ||
-      !copyFileReplacing(QDir(projectDir).filePath(QStringLiteral("PSXRecomp-Proof.zip")),
-                         QDir(stageDir).filePath(QStringLiteral("PSXRecomp-Proof.zip")), error)) {
-    fail(error.isEmpty() ? QStringLiteral("The final gbarecomp proof archive could not be embedded.") : error);
-    return;
-  }
-  if (macosTarget) {
-    const QString resources = QDir(stagedApp).filePath(QStringLiteral("Contents/Resources"));
-    if (!QDir().mkpath(resources) ||
-        !copyFileReplacing(QDir(projectDir).filePath(QStringLiteral("PSXRecomp-Proof.zip")),
-                           QDir(resources).filePath(QStringLiteral("PSXRecomp-Proof.zip")), error) ||
-        !copyFileReplacing(QDir(projectDir).filePath(QStringLiteral("game.manifest.json")),
-                           QDir(resources).filePath(QStringLiteral("game.manifest.json")), error)) {
-      fail(error);
-      return;
-    }
-    if (signingRequested) {
-      const QString passwordPath = QDir(workspace).filePath(QStringLiteral("pfx-password.txt"));
-      QFile password(passwordPath);
-      const QByteArray bytes = request.certificatePassword.toUtf8();
-      if (!password.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
-          !password.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner) ||
-          password.write(bytes) != bytes.size()) {
-        fail(QStringLiteral("Could not prepare the temporary signing password file."));
-        return;
-      }
-      password.close();
-      if (!runCommand(rcodesign,
-          { QStringLiteral("sign"), QStringLiteral("--p12-file"), request.certificatePath,
-            QStringLiteral("--p12-password-file"), passwordPath,
-            QStringLiteral("--code-signature-flags"), QStringLiteral("main:runtime"), stagedApp },
-          workspace, QStringLiteral("rcodesign sign --p12-file <certificate> <gbarecomp app>"),
-          10 * 60 * 1000)) {
-        QFile::remove(passwordPath);
-        fail(QStringLiteral("The gbarecomp app could not be signed with the selected PFX."));
-        return;
-      }
-      QFile::remove(passwordPath);
-    } else if (!runCommand(QStringLiteral("/usr/bin/codesign"),
-                           { QStringLiteral("--force"), QStringLiteral("--deep"),
-                             QStringLiteral("--sign"), QStringLiteral("-"), stagedApp },
-                           workspace, QStringLiteral("codesign --force --deep --sign - <gbarecomp app>"),
-                           5 * 60 * 1000)) {
-      fail(QStringLiteral("The gbarecomp app could not be ad-hoc signed."));
-      return;
-    }
-    if (!runCommand(QStringLiteral("/usr/bin/codesign"),
-                    { QStringLiteral("--verify"), QStringLiteral("--deep"),
-                      QStringLiteral("--strict"), stagedApp }, workspace,
-                    QStringLiteral("codesign --verify --deep --strict <gbarecomp app>"), 60000)) {
-      fail(QStringLiteral("The staged gbarecomp app failed code-signature verification."));
-      return;
-    }
-  }
-  const QString sealedExecutableHash = sha256File(mainExecutable, error);
-  if (sealedExecutableHash.isEmpty()) {
-    fail(error);
-    return;
-  }
-  emit logLine(QStringLiteral("Verified gbarecomp executable SHA-256: %1")
-                 .arg(sealedExecutableHash));
-
-  nextStage(QStringLiteral("Deliver gbarecomp package"));
-  const QString output = QDir(request.outputDirectory).filePath(exportOutputName(request));
-  bool delivered = false;
-  if (request.exportAsZip) {
-    delivered = publishZip(stageDir, {}, output);
-  } else if (macosTarget) {
-    delivered = publishDirectory(stagedApp, output);
-  } else {
-    delivered = publishDirectory(stageDir, output);
-  }
-  if (!delivered) {
-    if (cancellationRequested()) cancelledOut();
-    else fail(error.isEmpty() ? QStringLiteral("The gbarecomp package could not be delivered.") : error);
-    return;
-  }
-  if (!request.exportAsZip) {
-    const QString deliveredExecutable = macosTarget
-      ? QDir(output).filePath(QStringLiteral("Contents/MacOS/") + bundleName)
-      : QDir(output).filePath(bundleName + executableExtension);
-    if (sha256File(deliveredExecutable, error) != sealedExecutableHash) {
-      fail(error.isEmpty() ? QStringLiteral("The delivered gbarecomp executable changed during publication.") : error);
-      return;
-    }
-  }
-  emit logLine(QStringLiteral("gbarecomp package created: %1").arg(output));
-  QDir(workspace).removeRecursively();
-  emit completed(output);
-}
-
-/* Vita and Horizon.
- *
- * This is the one pipeline in Studio with no recompilation stage, and its
- * absence is the point rather than an omission. The Vita is an ARMv7-A
- * Cortex-A9, 32-bit Horizon is ARMv7-A, and the MVII device is an ARMv7-A
- * Cortex-A7 — one instruction set across all three, so the guest's own code
- * runs on the CPU untranslated. What the device is missing is the guest's
- * operating system, and that is what extra/vita2hos and extra/horizon2mvii
- * supply. The WINE model.
- *
- * So the export is: identify the container and refuse it here if the front-end
- * cannot open it, cross-compile the front-end for Cortex-A7, and stage the
- * guest image beside the .virtua as `executable` — the path both front-ends
- * read from argv[1]. Virtua ARM only; there is no desktop form of this and
- * never could be. */
-void PipelineWorker::runGuestApp(const PipelineRequest& request) {
-  const bool vita = request.system == SystemKind::Vita;
-  const QString systemName = systemKindDisplayName(request.system);
-  const QString frontEnd = systemFrontEndName(request.system);
-  const QString frontEndDir = vita ? QStringLiteral("vita2hos")
-                                   : QStringLiteral("horizon2mvii");
-  const bool sourceExport = request.exportMode == ExportMode::Source;
-  const bool remoteCiBuild = request.exportMode == ExportMode::Build &&
-                             request.buildBackend == BuildBackend::RemoteCi;
-  const bool localBuild = request.exportMode == ExportMode::Build && !remoteCiBuild;
-  const int totalStages = localBuild ? 8 : 5;
-  int stage = 0;
-  QString workspace;
-  QString error;
-  auto nextStage = [&](const QString& name) {
-    emit stageChanged(name, ++stage, totalStages);
-    emit logLine(QStringLiteral("\n=== %1 ===").arg(name));
-  };
-  auto fail = [&](const QString& message) {
-    emit logLine(QStringLiteral("ERROR: %1").arg(message));
-    emit failed(message, workspace);
-  };
-  auto cancelledOut = [&]() {
-    if (!workspace.isEmpty()) QDir(workspace).removeRecursively();
-    emit cancelled();
-  };
-
-  nextStage(QStringLiteral("Validate %1 application").arg(systemName));
-  // Not a packaging gap: an x86_64 build would compile the whole loader and
-  // then have nothing it could branch to, which is a worse failure than not
-  // building because it looks like it works. Both front-ends refuse a non-ARM
-  // CMAKE_SYSTEM_PROCESSOR for the same reason.
-  if (request.targetPlatform != TargetPlatform::VirtuaArm) {
-    fail(QStringLiteral("%1 applications are Virtua ARM only: the guest's ARMv7 code runs on the device's ARMv7 CPU, so there is no %2 form of this package.")
-           .arg(systemName, targetPlatformDisplayName(request.targetPlatform)));
-    return;
-  }
-  if (!isPowerEngineRoot(request.powerEngineRoot)) {
-    fail(QStringLiteral("The selected PowerEngine root does not contain the canonical Virtua/MVII sources."));
-    return;
-  }
-  if (!isVirtuaLlvmRoot(request.llvmRoot)) {
-    fail(QStringLiteral("The selected LLVM root is not a complete PowerEngine compiler bundle."));
-    return;
-  }
-  GuestAppDescription app;
-  if (!inspectGuestApp(request.system, request.romPath, app, error)) {
-    fail(error);
-    return;
-  }
-  // The front-end refuses this too, but only after the package has been built,
-  // copied to the device and launched. Refusing here costs nothing and names
-  // the format that was actually found.
-  // What the container said about itself, whether or not it turns out to be
-  // loadable: a package that is refused is refused at one named layer, and the
-  // layers above it were read.
-  for (const QString& note : app.notes) emit logLine(note);
-  if (!app.contents.isEmpty()) {
-    emit logLine(QStringLiteral("%1 contains:").arg(app.containerName));
-    for (const QString& entry : app.contents)
-      emit logLine(QStringLiteral("  %1").arg(entry));
-  }
-  if (!app.loadable()) {
-    fail(QStringLiteral("%1 cannot load this file. %2").arg(frontEnd, app.refusal));
-    return;
-  }
-  if (request.skipBiosBoot) {
-    fail(QStringLiteral("%1 has no BIOS to skip: the guest's own code is loaded and branched to directly.")
-           .arg(systemName));
-    return;
-  }
-  const QString iconSourcePath = request.iconPath.trimmed().isEmpty()
-    ? QStringLiteral(":/psxrecomp/studio/resources/psxrecomp-studio.svg")
-    : request.iconPath;
-  if (!QFileInfo(iconSourcePath).isFile() && !iconSourcePath.startsWith(QStringLiteral(":/"))) {
-    fail(QStringLiteral("The selected app icon is not readable."));
-    return;
-  }
-  const QString bundleName = cleanBundleName(request.windowTitle);
-  if (bundleName.isEmpty()) {
-    fail(QStringLiteral("The window title cannot be converted to a valid app name."));
-    return;
-  }
-  if (!QFileInfo(request.outputDirectory).isDir() ||
-      !QFileInfo(request.outputDirectory).isWritable()) {
-    fail(QStringLiteral("Select a writable output directory."));
-    return;
-  }
-  const QString frontEndRoot =
-    QDir(request.frameworkRoot).filePath(QStringLiteral("extra/%1").arg(frontEndDir));
-  const QString virtuaRoot =
-    QDir(request.frameworkRoot).filePath(QStringLiteral("extra/virtua"));
-  const QString elfInfoTool = QDir(virtuaRoot).filePath(QStringLiteral("tools/elfinfo.py"));
-  for (const auto& required : {
-         QDir(frontEndRoot).filePath(QStringLiteral("CMakeLists.txt")),
-         QDir(virtuaRoot).filePath(QStringLiteral("CMake/VirtuaArmToolchain.cmake")),
-         QDir(virtuaRoot).filePath(QStringLiteral("CMake/VirtuaPowerEngine.cmake")),
-         QDir(virtuaRoot).filePath(QStringLiteral("wine/CMakeLists.txt")),
-         elfInfoTool }) {
-    if (!QFileInfo(required).isFile()) {
-      fail(QStringLiteral("The framework does not contain the %1 front-end: %2 is missing.")
-             .arg(frontEnd, required));
-      return;
-    }
-  }
-  const QString cmake = findExecutable(QStringLiteral("cmake"));
-  const QString git = findExecutable(QStringLiteral("git"));
-  if (cmake.isEmpty() || git.isEmpty()) {
-    fail(QStringLiteral("%1 exports require CMake and Git.").arg(systemName));
-    return;
-  }
-  // Single-configuration Ninja whatever the host is, PowerEngine's packager
-  // built from Go source on first use, and Python to read the linked ELF: the
-  // compiler bundle ships no llvm-nm and macOS nm cannot read ELF at all.
-  const QString ninja = localBuild ? findExecutable(QStringLiteral("ninja")) : QString();
-  const QString go = localBuild ? findExecutable(QStringLiteral("go")) : QString();
-  const QString python = localBuild ? findWorkingPython() : QString();
-  if (localBuild) {
-    const QList<QPair<QString, QString>> tools{
-      { QStringLiteral("Ninja"), ninja },
-      { QStringLiteral("Go for the Virtua packager"), go },
-      { QStringLiteral("Python 3 for ELF verification"), python },
-    };
-    for (const auto& tool : tools) {
-      if (tool.second.isEmpty()) {
-        fail(QStringLiteral("A Virtua ARM %1 package requires %2 on the build host.")
-               .arg(systemName, tool.first));
-        return;
-      }
-    }
-  }
-  // Two hashes when the image comes out of a package, and they are different
-  // things: this one identifies the file that was selected, and the one taken
-  // after staging identifies the module that will actually be loaded.
-  // A directory has no hash of its own; what identifies an unpacked title is
-  // the staged tree, and that is hashed file by file after staging.
-  const bool containerIsDirectory = QFileInfo(request.romPath).isDir();
-  QString containerSha256;
-  if (!containerIsDirectory) {
-    containerSha256 = sha256File(request.romPath, error);
-    if (containerSha256.isEmpty()) {
-      fail(error.isEmpty() ? QStringLiteral("The selected file could not be hashed.") : error);
-      return;
-    }
-  }
-  QString imageSha256;
-  emit logLine(QStringLiteral("%1 application: %2 · %3 · %4 bytes")
-                 .arg(systemName, app.containerName, guestArchName(app.arch))
-                 .arg(app.size));
-  if (containerIsDirectory) {
-    emit logLine(QStringLiteral("%1 is a directory: each staged file is hashed below.")
-                   .arg(QDir(request.romPath).dirName()));
-  } else {
-    emit logLine(QStringLiteral("SHA-256 (%1): %2")
-                   .arg(QFileInfo(request.romPath).fileName(), containerSha256));
-  }
-  emit logLine(QStringLiteral("Execution: direct — the guest is ARMv7 and so is the device, so its instructions are not translated. %1 supplies the guest's operating system.")
-                 .arg(frontEnd));
-  if (app.arch == GuestArch::Unknown) {
-    // Studio applies the entry-branch signal only; horizon_image_probe_arch
-    // also reads .dynamic, which is reachable only after the module is decoded,
-    // and refuses if the two disagree.
-    emit logLine(QStringLiteral("Note: the entry word does not identify the architecture. %1 decides on the device, where it can read .dynamic as well.")
-                   .arg(frontEnd));
-  }
-
-  nextStage(QStringLiteral("Prepare %1 package workspace").arg(frontEnd));
-  const QString preferredWorkspaceRoot =
-    QDir(QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation))
-      .filePath(QStringLiteral("org.psxrecomp.studio/workspaces"));
-  const QString fallbackWorkspaceRoot =
-    QDir(QDir::tempPath()).filePath(QStringLiteral("org.psxrecomp.studio/workspaces"));
-  std::unique_ptr<QTemporaryDir> temporary;
-  for (const QString& root : { preferredWorkspaceRoot, fallbackWorkspaceRoot }) {
-    if (!QDir().mkpath(root)) continue;
-    auto candidate = std::make_unique<QTemporaryDir>(
-      QDir(root).filePath(QStringLiteral("psxrecomp-%1-XXXXXX").arg(frontEnd)));
-    candidate->setAutoRemove(false);
-    if (candidate->isValid()) {
-      temporary = std::move(candidate);
-      break;
-    }
-  }
-  if (!temporary) {
-    fail(QStringLiteral("Could not create a %1 build workspace in the cache or temporary directory.")
-           .arg(systemName));
-    return;
-  }
-  workspace = temporary->path();
-  const QString projectDir = QDir(workspace).filePath(QStringLiteral("project"));
-  const QString inputsDir = QDir(projectDir).filePath(QStringLiteral("package_inputs"));
-  const QString proofDir = QDir(projectDir).filePath(QStringLiteral("proof"));
-  const QString buildDir = QDir(workspace).filePath(QStringLiteral("build"));
-  const QString stageDir = QDir(workspace).filePath(QStringLiteral("stage"));
-  const QString frameworkExtra = QDir(projectDir).filePath(QStringLiteral("framework/extra"));
-  for (const auto& path : { projectDir, inputsDir, proofDir, buildDir, stageDir,
-                            frameworkExtra }) {
-    if (!QDir().mkpath(path)) {
-      fail(QStringLiteral("Could not create workspace directory %1.").arg(path));
-      return;
-    }
-  }
-  // The front-end includes ../../extra/virtua/CMake/VirtuaPowerEngine.cmake by
-  // relative path, so the two have to land in the project the way they sit in
-  // the framework. Nothing from PowerEngine itself is copied: the toolchain,
-  // sysroot, R-Dash, linker script and packager are all resolved out of
-  // POWERENGINE_ROOT at configure time.
-  if (!copySourceDirectory(frontEndRoot,
-                           QDir(frameworkExtra).filePath(frontEndDir), error) ||
-      !copySourceDirectory(virtuaRoot,
-                           QDir(frameworkExtra).filePath(QStringLiteral("virtua")), error) ||
-      !createPngIcon(iconSourcePath,
-                     QDir(projectDir).filePath(QStringLiteral("AppIcon.png")), error)) {
-    fail(error);
-    return;
-  }
-  // The guest image. A bare module is staged as it stands; a package is opened
-  // and the module is taken out of it, with what the package carried alongside
-  // written to package_inputs/container so the extraction can be checked
-  // against its source.
-  QString stagedExecutable;
-  QStringList stageLog;
-  if (!stageGuestApp(app, request.romPath, inputsDir, stagedExecutable, stageLog, error)) {
-    fail(error);
-    return;
-  }
-  for (const QString& line : stageLog)
-    emit logLine(QStringLiteral("  %1").arg(line));
-  imageSha256 = sha256File(stagedExecutable, error);
-  if (imageSha256.isEmpty()) {
-    fail(error.isEmpty() ? QStringLiteral("The guest image could not be hashed.") : error);
-    return;
-  }
-  if (app.requiresExtraction) {
-    emit logLine(QStringLiteral("Guest image: %1 out of the %2 · %3 bytes · SHA-256 %4")
-                   .arg(app.executableName, app.containerName)
-                   .arg(QFileInfo(stagedExecutable).size())
-                   .arg(imageSha256));
-  }
-
-  // What was staged as the guest's data, hashed here rather than asserted. The
-  // list is read back off disk instead of from the staging log so the proof
-  // describes the files that exist, not the files that were meant to.
-  QJsonArray stagedData;
-  quint64 stagedDataBytes = 0;
-  {
-    const QString dataDir = QDir(inputsDir).filePath(QStringLiteral("data"));
-    QStringList relative;
-    QDirIterator iterator(dataDir, QDir::Files, QDirIterator::Subdirectories);
-    while (iterator.hasNext()) relative.append(QDir(dataDir).relativeFilePath(iterator.next()));
-    relative.sort();
-    for (const QString& name : relative) {
-      const QString absolute = QDir(dataDir).filePath(name);
-      const QString hash = sha256File(absolute, error);
-      if (hash.isEmpty()) {
-        fail(error.isEmpty()
-               ? QStringLiteral("The staged guest data at %1 could not be hashed.")
-                   .arg(absolute)
-               : error);
-        return;
-      }
-      const qint64 bytes = QFileInfo(absolute).size();
-      stagedDataBytes += static_cast<quint64>(bytes);
-      stagedData.append(QJsonObject{
-        { QStringLiteral("path"), QStringLiteral("data/") + name },
-        { QStringLiteral("bytes"), static_cast<double>(bytes) },
-        { QStringLiteral("sha256"), hash },
-      });
-    }
-    if (!relative.isEmpty()) {
-      emit logLine(QStringLiteral("Guest data: %1 file(s), %2 bytes staged as data/")
-                     .arg(relative.size()).arg(stagedDataBytes));
-    }
-  }
-
-  nextStage(QStringLiteral("Finalize %1 CMake repository").arg(frontEnd));
-  QJsonArray containerContents;
-  for (const QString& entry : app.contents) containerContents.append(entry);
-  QJsonArray containerNotes;
-  for (const QString& note : app.notes) containerNotes.append(note);
-  const QJsonObject identificationProof{
-    { QStringLiteral("schema"), 1 },
-    { QStringLiteral("system"), systemKindKey(request.system) },
-    { QStringLiteral("front_end"), frontEnd },
-    { QStringLiteral("execution"), QStringLiteral("direct-execution") },
-    { QStringLiteral("execution_note"),
-      QStringLiteral("guest CPU is ARMv7, same as the device; guest instructions "
-                     "run untranslated and the guest's OS is reimplemented around "
-                     "them (the WINE model)") },
-    { QStringLiteral("recompilation"), false },
-    { QStringLiteral("container"), app.containerName },
-    { QStringLiteral("guest_architecture"), guestArchName(app.arch) },
-    { QStringLiteral("architecture_signal"),
-      QStringLiteral("entry branch encoding; the front-end additionally reads "
-                     ".dynamic and refuses when the two disagree") },
-    { QStringLiteral("container_title"), app.containerTitle },
-    { QStringLiteral("container_title_id"), app.containerTitleId },
-    { QStringLiteral("container_bytes"), static_cast<double>(app.size) },
-    // Empty for an unpacked title: a directory has no hash, and what identifies
-    // it is the per-file list under `data` below.
-    { QStringLiteral("container_is_directory"), containerIsDirectory },
-    { QStringLiteral("container_sha256"), containerSha256 },
-    { QStringLiteral("container_contents"), containerContents },
-    { QStringLiteral("container_notes"), containerNotes },
-    // The image the front-end loads. Equal to the container above when the
-    // selected file was already the module; otherwise this is what came out of
-    // it, and `extracted_entry` is the entry it came from.
-    { QStringLiteral("extracted_from_container"), app.requiresExtraction },
-    { QStringLiteral("extracted_entry"),
-      app.requiresExtraction ? app.executableName : QString() },
-    { QStringLiteral("image_bytes"),
-      static_cast<double>(QFileInfo(stagedExecutable).size()) },
-    { QStringLiteral("image_sha256"), imageSha256 },
-    { QStringLiteral("image_staged_as"), QStringLiteral("executable") },
-    // And the rest of what came out of the container: the whole ExeFS and the
-    // RomFS image for a Switch package, the whole decrypted title tree for a
-    // Vita one. `executable` is one entry of this.
-    { QStringLiteral("data_staged_as"), QStringLiteral("data/") },
-    { QStringLiteral("data_files"), stagedData.size() },
-    { QStringLiteral("data_bytes"), static_cast<double>(stagedDataBytes) },
-    { QStringLiteral("data"), stagedData },
-  };
-  if (!writeText(QDir(projectDir).filePath(QStringLiteral("CMakeLists.txt")),
-                 generatedGuestAppProjectCMake(request, app, bundleName), error) ||
-      !writeText(QDir(projectDir).filePath(QStringLiteral("README.md")),
-                 generatedGuestAppReadme(request, app, bundleName), error) ||
-      !writeJson(QDir(projectDir).filePath(QStringLiteral("game.manifest.json")),
-                 gameManifestForRequest(request), error) ||
-      !writeJson(QDir(proofDir).filePath(QStringLiteral("guest_image_identification.json")),
-                 identificationProof, error) ||
-      !createProofArchive(proofDir,
-                          QDir(projectDir).filePath(QStringLiteral("PSXRecomp-Proof.zip")), error)) {
-    fail(error);
-    return;
-  }
-
-  QByteArray commitOutput;
-  if (!runCommand(git, { QStringLiteral("init"), QStringLiteral("--initial-branch=main") },
-                  projectDir, QStringLiteral("git init --initial-branch=main"), 60000) ||
-      !runCommand(git, { QStringLiteral("config"), QStringLiteral("user.name"),
-                         QStringLiteral("PSXRecomp Studio") }, projectDir,
-                  QStringLiteral("git config user.name <studio>"), 30000) ||
-      !runCommand(git, { QStringLiteral("config"), QStringLiteral("user.email"),
-                         QStringLiteral("studio@psxrecomp.local") }, projectDir,
-                  QStringLiteral("git config user.email <studio>"), 30000) ||
-      !runCommand(git, { QStringLiteral("add"), QStringLiteral("-A") }, projectDir,
-                  QStringLiteral("git add -A"), 2 * 60 * 60 * 1000) ||
-      !runCommand(git, { QStringLiteral("commit"), QStringLiteral("-m"),
-                         QStringLiteral("Generate %1 Virtua ARM %2 source")
-                           .arg(request.windowTitle, frontEnd) },
-                  projectDir, QStringLiteral("git commit -m <generated source>"),
-                  2 * 60 * 60 * 1000) ||
-      !runCommand(git, { QStringLiteral("rev-parse"), QStringLiteral("HEAD") },
-                  projectDir, QStringLiteral("git rev-parse HEAD"), 30000, &commitOutput)) {
-    if (cancellationRequested()) cancelledOut();
-    else fail(QStringLiteral("The generated %1 source repository could not be committed.")
-                .arg(frontEnd));
-    return;
-  }
-  const QString sourceCommit = QString::fromUtf8(commitOutput).trimmed().section('\n', -1);
-  emit logLine(QStringLiteral("Generated %1 source commit: %2").arg(frontEnd, sourceCommit));
-
-  auto removeEntry = [](const QString& path) {
-    const QFileInfo info(path);
-    if (!info.exists() && !info.isSymLink()) return true;
-    return info.isDir() && !info.isSymLink() ? QDir(path).removeRecursively()
-                                             : QFile::remove(path);
-  };
-  auto publishZip = [&](const QString& source, const QString& rootName,
-                        const QString& output) -> bool {
-    const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    const QString staging = output + QStringLiteral(".psxrecomp-new-") + token;
-    const QString backup = output + QStringLiteral(".psxrecomp-old-") + token;
-    removeEntry(staging); removeEntry(backup);
-    if (!createPackageArchive(source, rootName, staging, error, {},
-                              [this]() { return cancellationRequested(); })) {
-      removeEntry(staging); return false;
-    }
-    const QString stagedHash = sha256File(staging, error);
-    if (stagedHash.isEmpty()) { removeEntry(staging); return false; }
-    const bool exists = QFileInfo::exists(output) || QFileInfo(output).isSymLink();
-    if (exists && !request.overwriteOutput) {
-      error = QStringLiteral("The output already exists and overwrite was not approved: %1").arg(output);
-      removeEntry(staging); return false;
-    }
-    if (exists && !QFile::rename(output, backup)) {
-      error = QStringLiteral("Could not preserve the previous output: %1").arg(output);
-      removeEntry(staging); return false;
-    }
-    if (!QFile::rename(staging, output)) {
-      if (exists) QFile::rename(backup, output);
-      error = QStringLiteral("Could not publish %1.").arg(output);
-      return false;
-    }
-    if (exists) removeEntry(backup);
-    return sha256File(output, error) == stagedHash;
-  };
-  auto publishDirectory = [&](const QString& source, const QString& output) -> bool {
-    const QString token = QUuid::createUuid().toString(QUuid::WithoutBraces);
-    const QString staging = output + QStringLiteral(".psxrecomp-new-") + token;
-    const QString backup = output + QStringLiteral(".psxrecomp-old-") + token;
-    removeEntry(staging); removeEntry(backup);
-    if (!copyDirectoryTree(source, staging, error)) return false;
-    const bool exists = QFileInfo::exists(output) || QFileInfo(output).isSymLink();
-    if (exists && !request.overwriteOutput) {
-      error = QStringLiteral("The output already exists and overwrite was not approved: %1").arg(output);
-      removeEntry(staging); return false;
-    }
-    if (exists && !QDir().rename(output, backup)) {
-      error = QStringLiteral("Could not preserve the previous output: %1").arg(output);
-      removeEntry(staging); return false;
-    }
-    if (!QDir().rename(staging, output)) {
-      if (exists) QDir().rename(backup, output);
-      error = QStringLiteral("Could not publish %1.").arg(output);
-      return false;
-    }
-    if (exists) removeEntry(backup);
-    return true;
-  };
-
-  if (sourceExport) {
-    nextStage(QStringLiteral("Deliver %1 source repository").arg(frontEnd));
-    const QString output = QDir(request.outputDirectory).filePath(exportOutputName(request));
-    const bool ok = request.exportAsZip
-      ? publishZip(projectDir, QFileInfo(output).completeBaseName(), output)
-      : publishDirectory(projectDir, output);
-    if (!ok) {
-      if (cancellationRequested()) cancelledOut(); else fail(error);
-      return;
-    }
-    QDir(workspace).removeRecursively();
-    emit completed(output);
-    return;
-  }
-
-  if (remoteCiBuild) {
-    nextStage(QStringLiteral("Stage %1 source for CI").arg(frontEnd));
-    const QString ciRoot =
-      QDir(QStandardPaths::writableLocation(QStandardPaths::GenericCacheLocation))
-        .filePath(QStringLiteral("org.psxrecomp.studio/psxrecomp-ci-sources"));
-    if (!QDir().mkpath(ciRoot)) {
-      fail(QStringLiteral("Could not create the CI source cache."));
-      return;
-    }
-    const QString ciRepository = QDir(ciRoot).filePath(
-      QStringLiteral("%1-%2-%3-%4")
-        .arg(sanitizedFileStem(request.windowTitle), frontEnd,
-             targetPlatformKey(request.targetPlatform),
-             QUuid::createUuid().toString(QUuid::WithoutBraces)));
-    if (!QDir().rename(projectDir, ciRepository) &&
-        (!copyDirectoryTree(projectDir, ciRepository, error) ||
-         !QDir(projectDir).removeRecursively())) {
-      fail(error.isEmpty()
-        ? QStringLiteral("Could not stage the %1 source repository for CI.").arg(frontEnd)
-        : error);
-      return;
-    }
-    QDir(workspace).removeRecursively();
-    emit ciSourcePrepared(request, ciRepository, sourceCommit);
-    return;
-  }
-
-  nextStage(QStringLiteral("Cross-compile %1 for Virtua ARM").arg(frontEnd));
-  const QStringList configure{
-    QStringLiteral("-S"), projectDir, QStringLiteral("-B"), buildDir,
-    QStringLiteral("-G"), QStringLiteral("Ninja"),
-    QStringLiteral("-DCMAKE_BUILD_TYPE=Release"),
-    QStringLiteral("-DCMAKE_TOOLCHAIN_FILE=%1")
-      .arg(QDir(projectDir).filePath(QStringLiteral(
-        "framework/extra/virtua/CMake/VirtuaArmToolchain.cmake"))),
-    QStringLiteral("-DPOWERENGINE_ROOT=%1").arg(request.powerEngineRoot),
-    QStringLiteral("-DVIRTUA_LLVM_ROOT=%1").arg(request.llvmRoot),
-  };
-  const QStringList build{
-    QStringLiteral("--build"), buildDir, QStringLiteral("--target"),
-    QStringLiteral("guest-runtime"), QStringLiteral("--parallel"),
-    QString::number(std::max(1, QThread::idealThreadCount())),
-  };
-  if (!runCommand(cmake, configure, workspace,
-                  QStringLiteral("cmake -S <%1 project> -B <build>").arg(frontEnd),
-                  10 * 60 * 1000) ||
-      !runCommand(cmake, build, workspace,
-                  QStringLiteral("cmake --build <build> --target guest-runtime"),
-                  2 * 60 * 60 * 1000)) {
-    if (cancellationRequested()) cancelledOut();
-    else fail(QStringLiteral("The Virtua ARM %1 package could not be built and staged.")
-                .arg(frontEnd));
-    return;
-  }
-  const QString builtPackage =
-    QDir(buildDir).filePath(QStringLiteral("steganos-package/guest-runtime/Release"));
-  QDir(stageDir).removeRecursively();
-  if (!copyDirectoryTree(builtPackage, stageDir, error)) {
-    fail(error.isEmpty()
-      ? QStringLiteral("The built %1 package could not be staged.").arg(frontEnd) : error);
-    return;
-  }
-  const QString mainExecutable =
-    QDir(stageDir).filePath(bundleName + QStringLiteral(".virtua"));
-  const QString packagedImage = QDir(stageDir).filePath(QStringLiteral("executable"));
-  if (!QFileInfo(mainExecutable).isFile() || !QFileInfo(packagedImage).isFile()) {
-    fail(QStringLiteral("The Virtua ARM %1 package is missing its .virtua image or the guest executable beside it.")
-           .arg(frontEnd));
-    return;
-  }
-  // And the guest's data. `executable` is only the module that is branched to —
-  // for a Switch package the ExeFS `main`, which is under 2% of the title — so a
-  // package that carries it and nothing else builds, verifies and then has
-  // nothing to load. The build was supposed to copy package_inputs/data beside
-  // the runtime; this is where that is established rather than assumed, by
-  // re-hashing what arrived against what was staged.
-  //
-  // `executable` gets the same treatment for the same reason: it is not a
-  // convenience copy, it is what the front-end opens. MVII launches a package
-  // by its `.virtua` and passes no arguments, so vwine_package_resolve_image
-  // reads the guest out of `executable` beside it — a package that lost that
-  // file starts and immediately reports that it has no guest to run.
-  const QString packagedImageHash = sha256File(packagedImage, error);
-  if (packagedImageHash.isEmpty()) {
-    fail(error.isEmpty()
-      ? QStringLiteral("The guest image in the built %1 package could not be read.")
-          .arg(frontEnd) : error);
-    return;
-  }
-
-  quint64 packagedDataBytes = 0;
-  for (const QJsonValue& value : stagedData) {
-    const QJsonObject entry = value.toObject();
-    const QString relative = entry.value(QStringLiteral("path")).toString();
-    const QString packaged = QDir(stageDir).filePath(relative);
-    if (!QFileInfo(packaged).isFile()) {
-      fail(QStringLiteral(
-        "The built %1 package is missing %2. The export staged it under "
-        "package_inputs/, so the `guest-data` target did not run or did not "
-        "reach the staging directory.").arg(frontEnd, relative));
-      return;
-    }
-    if (sha256File(packaged, error) != entry.value(QStringLiteral("sha256")).toString()) {
-      fail(error.isEmpty()
-        ? QStringLiteral("%1 in the built %2 package does not match the file staged for it.")
-            .arg(relative, frontEnd)
-        : error);
-      return;
-    }
-    packagedDataBytes +=
-      static_cast<quint64>(entry.value(QStringLiteral("bytes")).toDouble());
-  }
-  if (!stagedData.isEmpty()) {
-    emit logLine(QStringLiteral("Verified: the package carries the guest's data — %1 file(s), %2 bytes beside the runtime as data/")
-                   .arg(stagedData.size()).arg(packagedDataBytes));
-  }
-  // The staged guest image is the whole payload of this package: if it were
-  // altered in transit there would be nothing else in the package to notice.
-  if (sha256File(packagedImage, error) != imageSha256) {
-    fail(error.isEmpty()
-      ? QStringLiteral("The packaged guest image does not match the one staged for it.")
-      : error);
-    return;
-  }
-
-  nextStage(QStringLiteral("Verify %1 package").arg(frontEnd));
-  const QString linkedElf =
-    QDir(buildDir).filePath(QStringLiteral("%1/%2.elf").arg(frontEndDir, bundleName));
-  if (!QFileInfo(linkedElf).isFile()) {
-    fail(QStringLiteral("The Virtua ARM link did not produce %1, so the package cannot be verified.")
-           .arg(linkedElf));
-    return;
-  }
-  const QString projectElfInfo = QDir(projectDir).filePath(
-    QStringLiteral("framework/extra/virtua/tools/elfinfo.py"));
-  QByteArray attributes;
-  if (!runCommand(python, { projectElfInfo, QStringLiteral("armattrs"), linkedElf },
-                  workspace, QStringLiteral("elfinfo.py armattrs <%1 ELF>").arg(frontEnd),
-                  5 * 60 * 1000, &attributes)) {
-    fail(QStringLiteral("The Virtua ARM ELF has no readable .ARM.attributes section."));
-    return;
-  }
-  const QString attributeText = QString::fromUtf8(attributes);
-  // Tag_CPU_arch 10 is ARMv7 and Tag_CPU_arch_profile 65 is 'A'. This one
-  // matters more here than anywhere else in Studio: the whole design rests on
-  // the front-end and the guest sharing an instruction set.
-  if (!attributeText.contains(QStringLiteral("Tag_CPU_arch = 10")) ||
-      !attributeText.contains(QStringLiteral("Tag_CPU_arch_profile = 65"))) {
-    fail(QStringLiteral("The linked image is not tagged ARMv7-A:\n%1").arg(attributeText));
-    return;
-  }
-  // Nothing may be left undefined: the image is statically linked and MVII has
-  // no dynamic loader to resolve a straggler at run time.
-  QByteArray undefined;
-  if (!runCommand(python, { projectElfInfo, QStringLiteral("undef"), linkedElf },
-                  workspace, QStringLiteral("elfinfo.py undef <%1 ELF>").arg(frontEnd),
-                  5 * 60 * 1000, &undefined)) {
-    fail(QStringLiteral("The Virtua ARM image has undefined symbols, which MVII has no loader to resolve:\n%1")
-           .arg(QString::fromUtf8(undefined)));
-    return;
-  }
-  // vwine_make_executable is the shared layer's cache-maintenance barrier: a
-  // Cortex-A7's I-cache is not coherent with its D-cache, so a relocated image
-  // that is branched into without it executes whatever was in the line before.
-  // Its presence is the packaged proof that the loader was linked, not dropped.
-  // The second symbol is the front-end's own, so the package cannot pass with
-  // the shared layer alone.
-  const QString frontEndSymbol = vita ? QStringLiteral("load_file")
-                                      : QStringLiteral("horizon_image_probe_arch");
-  for (const QString& symbol : { QStringLiteral("vwine_make_executable"), frontEndSymbol }) {
-    QByteArray found;
-    if (!runCommand(python, { projectElfInfo, QStringLiteral("symbols"), linkedElf, symbol },
-                    workspace,
-                    QStringLiteral("elfinfo.py symbols <%1 ELF> %2").arg(frontEnd, symbol),
-                    5 * 60 * 1000, &found)) {
-      fail(QStringLiteral("The linked Virtua ARM image does not contain %1, so it cannot load the guest.")
-             .arg(symbol));
-      return;
-    }
-  }
-  // And the packaged container: a v3 image, ARM32, cooperatively scheduled. A
-  // preemptive image would be descheduled mid-frame by a kernel that expects
-  // the guest to yield.
-  QFile container(mainExecutable);
-  if (!container.open(QIODevice::ReadOnly)) {
-    fail(QStringLiteral("The staged .virtua image could not be read."));
-    return;
-  }
-  const QByteArray header = container.read(56);
-  container.close();
-  if (header.size() != 56 ||
-      qFromLittleEndian<quint32>(header.constData()) != 0x56495254u ||
-      qFromLittleEndian<quint32>(header.constData() + 4) != 3u) {
-    fail(QStringLiteral("The staged executable is not a Virtua v3 image."));
-    return;
-  }
-  const quint64 containerFlags = qFromLittleEndian<quint64>(header.constData() + 48);
-  if (((containerFlags >> 8u) & 0xffu) != 4u || (containerFlags & (1u << 1u)) == 0u) {
-    fail(QStringLiteral("The staged .virtua image is not a cooperative ARM32 executable (flags 0x%1).")
-           .arg(containerFlags, 16, 16, QLatin1Char('0')));
-    return;
-  }
-  emit logLine(QStringLiteral("Verified: a cooperative ARMv7-A Virtua image, nothing undefined, carrying the %1 loader and the guest image it will branch into.")
-                 .arg(frontEnd));
-
-  nextStage(QStringLiteral("Seal %1 package").arg(frontEnd));
-  const QString sealedExecutableHash = sha256File(mainExecutable, error);
-  const QJsonObject buildProof{
-    { QStringLiteral("schema"), 1 },
-    { QStringLiteral("platform"), targetPlatformDisplayName(request.targetPlatform) },
-    { QStringLiteral("system"), systemKindKey(request.system) },
-    { QStringLiteral("runtime"), frontEnd },
-    { QStringLiteral("execution"), QStringLiteral("direct-execution") },
-    { QStringLiteral("recompilation"), false },
-    { QStringLiteral("executable"), QFileInfo(mainExecutable).fileName() },
-    { QStringLiteral("target_architecture"), QStringLiteral("armv7a-none-eabi (Cortex-A7)") },
-    { QStringLiteral("guest_architecture"), guestArchName(app.arch) },
-    { QStringLiteral("guest_container"), app.containerName },
-    { QStringLiteral("guest_container_sha256"), containerSha256 },
-    { QStringLiteral("guest_image"), QStringLiteral("executable") },
-    { QStringLiteral("guest_image_source"),
-      app.requiresExtraction
-        ? QStringLiteral("%1, extracted from the %2").arg(app.executableName, app.containerName)
-        : QStringLiteral("the selected file, staged verbatim") },
-    { QStringLiteral("guest_image_sha256"), imageSha256 },
-    { QStringLiteral("host_runtime"),
-      QStringLiteral("%1 on MVII devices, over the shared virtua-wine guest-OS layer")
-        .arg(frontEnd) },
-    { QStringLiteral("armv7a_tagged"), true },
-    { QStringLiteral("undefined_symbols"), 0 },
-    { QStringLiteral("virtua_format_version"), 3 },
-    { QStringLiteral("virtua_cooperative"), true },
-    { QStringLiteral("virtua_arch_flag"), 4 },
-    { QStringLiteral("executable_sha256"), sealedExecutableHash },
-    { QStringLiteral("unresolved_import_policy"),
-      QStringLiteral("a hard failure reported by name; never bound to a stub") },
-    { QStringLiteral("package_contains_guest_image"), true },
-    // The data beside the runtime, verified in the built package rather than
-    // in the staging directory it was copied from.
-    { QStringLiteral("package_guest_data_files"), stagedData.size() },
-    { QStringLiteral("package_guest_data_bytes"), static_cast<double>(packagedDataBytes) },
-    { QStringLiteral("package_guest_image_sha256"), packagedImageHash },
-    { QStringLiteral("package_guest_image_resolved_by"),
-      QStringLiteral("vwine_package_resolve_image reads `executable` beside the "
-                     ".virtua; MVII launches a package with no arguments") },
-    { QStringLiteral("package_guest_data_verified"),
-      QStringLiteral("every file re-hashed in build/steganos-package after the "
-                     "build, against package_inputs/data") },
-    { QStringLiteral("signing_mode"), QStringLiteral("none") },
-  };
-  if (sealedExecutableHash.isEmpty() ||
-      !writeJson(QDir(proofDir).filePath(QStringLiteral("guest_build.json")), buildProof, error) ||
-      !createProofArchive(proofDir,
-                          QDir(projectDir).filePath(QStringLiteral("PSXRecomp-Proof.zip")), error) ||
-      !copyFileReplacing(QDir(projectDir).filePath(QStringLiteral("PSXRecomp-Proof.zip")),
-                         QDir(stageDir).filePath(QStringLiteral("PSXRecomp-Proof.zip")), error)) {
-    fail(error.isEmpty()
-      ? QStringLiteral("The final %1 proof archive could not be embedded.").arg(frontEnd) : error);
-    return;
-  }
-  emit logLine(QStringLiteral("Verified %1 executable SHA-256: %2")
-                 .arg(frontEnd, sealedExecutableHash));
-
-  nextStage(QStringLiteral("Deliver %1 package").arg(frontEnd));
-  const QString output = QDir(request.outputDirectory).filePath(exportOutputName(request));
-  const bool delivered = request.exportAsZip ? publishZip(stageDir, {}, output)
-                                             : publishDirectory(stageDir, output);
-  if (!delivered) {
-    if (cancellationRequested()) cancelledOut();
-    else fail(error.isEmpty()
-      ? QStringLiteral("The %1 package could not be delivered.").arg(frontEnd) : error);
-    return;
-  }
-  if (!request.exportAsZip) {
-    const QString deliveredExecutable =
-      QDir(output).filePath(bundleName + QStringLiteral(".virtua"));
-    if (sha256File(deliveredExecutable, error) != sealedExecutableHash) {
-      fail(error.isEmpty()
-        ? QStringLiteral("The delivered %1 executable changed during publication.").arg(frontEnd)
-        : error);
-      return;
-    }
-    // The guest image, re-hashed rather than sized, because it is the one file
-    // the front-end resolves and opens on the device with nothing else to fall
-    // back to.
-    if (sha256File(QDir(output).filePath(QStringLiteral("executable")), error) !=
-        packagedImageHash) {
-      fail(error.isEmpty()
-        ? QStringLiteral(
-            "The delivered %1 package has no usable `executable` beside its "
-            ".virtua. That is the file the front-end loads when the device "
-            "launches the package, so it would start and find no guest.")
-            .arg(frontEnd)
-        : error);
-      return;
-    }
-    // Publication is a tree copy and a rename, so the data is checked by name
-    // and size here rather than re-hashed: the hashes were established against
-    // the built package a moment ago, and this catches a copy that dropped a
-    // subdirectory.
-    for (const QJsonValue& value : stagedData) {
-      const QJsonObject entry = value.toObject();
-      const QString relative = entry.value(QStringLiteral("path")).toString();
-      const QFileInfo delivered(QDir(output).filePath(relative));
-      if (!delivered.isFile() ||
-          delivered.size() != static_cast<qint64>(
-            entry.value(QStringLiteral("bytes")).toDouble())) {
-        fail(QStringLiteral("The delivered %1 package is missing or truncated at %2.")
-               .arg(frontEnd, relative));
-        return;
-      }
-    }
-  }
-  emit logLine(QStringLiteral("%1 package created: %2").arg(frontEnd, output));
-  QDir(workspace).removeRecursively();
-  emit completed(output);
 }
 
 } // namespace psxstudio

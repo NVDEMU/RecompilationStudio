@@ -82,7 +82,7 @@ literal_internal_impl(::toml::detail::location loc)
 }
 
 inline ::toml::basic_value<TOML11_DEFAULT_COMMENT_STRATEGY, std::unordered_map, std::vector>
-operator"" _toml(const char* str, std::size_t len)
+operator""_toml(const char* str, std::size_t len)
 {
     ::toml::detail::location loc(
             std::string("TOML literal encoded in a C++ code"),
@@ -97,7 +97,7 @@ operator"" _toml(const char* str, std::size_t len)
 // value of u8"" literal has been changed from char to char8_t and char8_t is
 // NOT compatible to char
 inline ::toml::basic_value<TOML11_DEFAULT_COMMENT_STRATEGY, std::unordered_map, std::vector>
-operator"" _toml(const char8_t* str, std::size_t len)
+operator""_toml(const char8_t* str, std::size_t len)
 {
     ::toml::detail::location loc(
             std::string("TOML literal encoded in a C++ code"),

@@ -4,11 +4,7 @@
 #include "parity_trace.h"
 #include <string.h>
 
-#if defined(PSX_VIRTUA)
-#define PARITY_RING_CAP 2048u
-#else
-#define PARITY_RING_CAP 131072u
-#endif  /* power of two; ~128K thread1 events of history
+#define PARITY_RING_CAP 131072u  /* power of two; ~128K thread1 events of history
                                   * so the parked-thread1 divergence is in-window,
                                   * not just the wedge tail (~7.5 MB ring). */
 

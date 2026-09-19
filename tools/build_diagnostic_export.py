@@ -85,11 +85,13 @@ def main() -> int:
         framework,
     )
 
-    game_full = generated / f"{exe_stem}_full.c"
     game_dispatch = generated / f"{exe_stem}_dispatch.c"
-    bios_full = bios_generated / "SCPH1001_full.c"
     bios_dispatch = bios_generated / "SCPH1001_dispatch.c"
-    if not args.reuse_generated or not all(path.is_file() for path in (game_full, game_dispatch, bios_full, bios_dispatch)):
+    game_units = sorted(generated.glob(f"{exe_stem}_cu_*.c"))
+    bios_units = sorted(bios_generated.glob("SCPH1001_cu_*.c"))
+    if not args.reuse_generated or not game_units or not bios_units or not all(
+        path.is_file() for path in (game_dispatch, bios_dispatch)
+    ):
         run([str(recompiler_build / "psxrecomp-game"), "--config", "game.toml"], project)
         run(
             [
@@ -138,10 +140,14 @@ set(PSX_SETTINGS_MENU OFF CACHE BOOL "" FORCE)
 set(PSX_DEBUG_TOOLS ON CACHE BOOL "" FORCE)
 set(PSX_MACOS_GIP_GAMEPAD OFF CACHE BOOL "" FORCE)
 include(${{PSXRECOMP_ROOT}}/runtime/runtime.cmake)
+file(GLOB _PSX_BIOS_UNITS CONFIGURE_DEPENDS "{bios_generated}/SCPH1001_cu_*.c")
+file(GLOB _PSX_GAME_UNITS CONFIGURE_DEPENDS "{generated}/{exe_stem}_cu_*.c")
+list(SORT _PSX_BIOS_UNITS)
+list(SORT _PSX_GAME_UNITS)
 psxrecomp_add_runtime_target(psx-runtime
-  BIOS_GENERATED_FULL_C "{bios_full}"
+  BIOS_GENERATED_UNITS ${{_PSX_BIOS_UNITS}}
   BIOS_GENERATED_DISPATCH_C "{bios_dispatch}"
-  GAME_GENERATED_FULL_C "{game_full}"
+  GAME_GENERATED_UNITS ${{_PSX_GAME_UNITS}}
   GAME_GENERATED_DISPATCH_C "{game_dispatch}"
   DEBUG_PORT {args.debug_port}
   WINDOW_TITLE "{window_title} — diagnostic"

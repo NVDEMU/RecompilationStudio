@@ -11,13 +11,14 @@ set(PSXRECOMP_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." CACHE PATH
 
 include("${PSXRECOMP_ROOT}/runtime/runtime.cmake")
 
-set(GAME_GENERATED_FULL
-    "${CMAKE_CURRENT_SOURCE_DIR}/generated/cycle_testrom.exe_full.c")
+file(GLOB GAME_GENERATED_UNITS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/generated/cycle_testrom.exe_cu_*.c")
+list(SORT GAME_GENERATED_UNITS)
 set(GAME_GENERATED_DISPATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/generated/cycle_testrom.exe_dispatch.c")
 
 psxrecomp_add_runtime_target(psx-cyctest
-    GAME_GENERATED_FULL_C "${GAME_GENERATED_FULL}"
+    GAME_GENERATED_UNITS ${GAME_GENERATED_UNITS}
     GAME_GENERATED_DISPATCH_C "${GAME_GENERATED_DISPATCH}"
     DEBUG_PORT 4600
     WINDOW_TITLE "Cycle Test ROM"

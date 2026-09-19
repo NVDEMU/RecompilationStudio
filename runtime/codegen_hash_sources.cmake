@@ -25,6 +25,8 @@ set(PSXRECOMP_CODEGEN_HASH_SRCS
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/function_analysis.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/full_function_emitter.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/full_function_emitter.h
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/compilation_units.cpp
+    ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/compilation_units.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/strict_translator.cpp
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/strict_translator.h
     ${PSXRECOMP_CODEGEN_HASH_ROOT}/recompiler/src/function_discovery.cpp

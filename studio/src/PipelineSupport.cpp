@@ -226,8 +226,6 @@ QString exportOutputName(const PipelineRequest& request) {
         return bundleName + QStringLiteral("-Windows.zip");
       case TargetPlatform::Linux:
         return bundleName + QStringLiteral("-Linux.zip");
-      case TargetPlatform::VirtuaArm:
-        return bundleName + QStringLiteral("-Virtua-ARM.zip");
       case TargetPlatform::All:
         return {};
     }
@@ -239,8 +237,6 @@ QString exportOutputName(const PipelineRequest& request) {
       return bundleName + QStringLiteral("-Windows");
     case TargetPlatform::Linux:
       return bundleName + QStringLiteral("-Linux");
-    case TargetPlatform::VirtuaArm:
-      return bundleName + QStringLiteral("-Virtua-ARM");
     case TargetPlatform::All:
       return {};
   }
@@ -260,9 +256,6 @@ QJsonObject gameManifestForRequest(const PipelineRequest& request) {
     case TargetPlatform::Linux:
       executable = bundleName;
       break;
-    case TargetPlatform::VirtuaArm:
-      executable = bundleName + QStringLiteral(".virtua");
-      break;
     case TargetPlatform::All:
       break;
   }
@@ -271,9 +264,6 @@ QJsonObject gameManifestForRequest(const PipelineRequest& request) {
     { QStringLiteral("name"), request.windowTitle },
     { QStringLiteral("platform"), targetPlatformDisplayName(request.targetPlatform) },
   };
-  if (request.targetPlatform == TargetPlatform::VirtuaArm) {
-    manifest.insert(QStringLiteral("icon"), QStringLiteral("AppIcon.png"));
-  }
   return manifest;
 }
 
